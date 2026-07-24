@@ -68,20 +68,39 @@ Adding writers does nothing for `Always` (260 to 264 appends/s) because every ap
 
 Two results are worth more than the headline. Group commit batches 4 appends per flush where 8 are available, because the writer that owns a round starts the next flush before the writers it just released have queued their next record; holding a round open for a few microseconds, the commit delay of PostgreSQL, should close that gap and will be measured rather than assumed. And `Interval` is slower with eight writers than with one (271k against 513k appends/s): once the device is out of the way, the single append lock and its one write syscall per record become the bottleneck. That is the first thing the profiling stage will look at.
 
+## Memtable and engine
+
+```rust
+use lsmkv::{Engine, SyncPolicy};
+
+let db = Engine::open("data", SyncPolicy::default())?;
+db.set(b"user:1", b"nicolas")?;
+assert_eq!(db.get(b"user:1")?, Some(b"nicolas".to_vec()));
+db.delete(b"user:1")?;
+```
+
+A write is appended to the log, and only then applied to the sorted in-memory table, so nothing is visible before the sync policy considers it durable. The table is a `BTreeMap` behind one `RwLock`: readers run concurrently, writers take turns. Sorted, because a full table is flushed to disk in one sequential pass and that file has to come out sorted.
+
+One lock over the whole table rather than shards, because every write already passes through the log's single append lock, which the stage 1 numbers identify as the real serialization point. Sharding the table would optimize the wrong lock, and hash sharding would also cost the global sorted order the flush depends on.
+
+Each entry carries the sequence number the log gave its record, and an entry is replaced only by a higher one. Concurrent writers append to the log in one order and reach the table in another, so without that rule two writers racing on the same key can leave memory holding one value and the log another, and the store would silently change state on restart. The test that pins it down is `memory_and_the_log_agree_after_concurrent_writers`: eight threads write and delete over twenty shared keys, then the store is reopened and every key has to read back what memory held. Sequence numbers also have to continue past what recovery replayed, otherwise a fresh write looks older than the record it replaces.
+
+A delete writes a tombstone instead of erasing the entry, because the key may still live in an older file on disk. The tombstone is what shadows it until compaction drops both.
+
 ## Build order
 
 Each stage lands with its tests before the next one starts.
 
 1. **Write-ahead log** (built): append-only records with a per-record checksum, replayed at startup to rebuild the memtable, with the three sync policies measured above.
-2. **Memtable and engine API**: sorted in-memory table behind a trait, `get`, `set` and `delete` with tombstones, backed by the WAL.
+2. **Memtable and engine API** (built): sorted in-memory table, `get`, `set` and `delete` with tombstones, backed by the WAL and ordered by its sequence numbers.
 3. **SSTable**: writer and reader, sorted blocks, sparse index and footer at the end of the file, background flush of a full memtable.
 4. **Read path**: memtable, then immutable memtable, then files from newest to oldest, with a Bloom filter per file.
 5. **Compaction**: background merge, tombstone purge, manifest describing the live set of files.
 6. **Server**: RESP2 subset on tokio, so redis-cli and redis-benchmark drive the engine unchanged.
 7. **Benchmarks and profiling**: criterion micro-benchmarks, redis-benchmark end to end, flamegraph of the hot path.
-8. **Skiplist memtable**: hand-written concurrent skiplist measured against the BTreeMap baseline.
+8. **Skiplist memtable**: hand-written concurrent skiplist measured against the BTreeMap baseline. The memtable interface is extracted then, from two implementations rather than from one.
 
-Current stage: 2.
+Current stage: 3.
 
 ## Benchmarking
 

@@ -141,7 +141,13 @@ impl Wal {
             truncate(&file, path, valid_len)?;
         }
 
-        Ok((Self::new(path.to_path_buf(), file, policy), records))
+        // Sequence numbers continue where the file stops: the records just
+        // replayed keep the numbers 1 to N, and they are already durable.
+        let recovered = records.len() as u64;
+        Ok((
+            Self::new(path.to_path_buf(), file, policy, recovered),
+            records,
+        ))
     }
 
     /// Reads a log file without opening it for appending.
@@ -153,14 +159,17 @@ impl Wal {
         Replay::open(path.as_ref())
     }
 
-    fn new(path: PathBuf, file: File, policy: SyncPolicy) -> Self {
+    fn new(path: PathBuf, file: File, policy: SyncPolicy, recovered: u64) -> Self {
         let shared = Arc::new(Shared {
             path,
             file,
             policy,
             append: Mutex::new(Vec::new()),
-            written: AtomicU64::new(0),
-            sync: Mutex::new(SyncState::default()),
+            written: AtomicU64::new(recovered),
+            sync: Mutex::new(SyncState {
+                durable: recovered,
+                in_progress: false,
+            }),
             synced: Condvar::new(),
             flushes: AtomicU64::new(0),
             background_error: Mutex::new(None),
@@ -176,7 +185,10 @@ impl Wal {
         Self { shared, syncer }
     }
 
-    /// Appends `key` bound to `value`.
+    /// Appends `key` bound to `value` and returns its sequence number.
+    ///
+    /// Sequence numbers are handed out in append order and are what readers of
+    /// the log, memory included, use to tell which mutation is the newest.
     ///
     /// # Errors
     ///
@@ -187,11 +199,11 @@ impl Wal {
     ///
     /// Panics if a previous writer panicked while appending, which leaves the
     /// file with a partially written record.
-    pub fn set(&self, key: &[u8], value: &[u8]) -> Result<()> {
+    pub fn set(&self, key: &[u8], value: &[u8]) -> Result<u64> {
         self.shared.append(key, Some(value))
     }
 
-    /// Appends a tombstone for `key`.
+    /// Appends a tombstone for `key` and returns its sequence number.
     ///
     /// # Errors
     ///
@@ -200,7 +212,7 @@ impl Wal {
     /// # Panics
     ///
     /// Same as [`Wal::set`].
-    pub fn delete(&self, key: &[u8]) -> Result<()> {
+    pub fn delete(&self, key: &[u8]) -> Result<u64> {
         self.shared.append(key, None)
     }
 
@@ -226,7 +238,8 @@ impl Wal {
         self.shared.flushes.load(Ordering::Relaxed)
     }
 
-    /// Records appended since the log was opened.
+    /// Records the log holds, the ones replayed at recovery included. This is
+    /// also the sequence number of the most recent append.
     pub fn record_count(&self) -> u64 {
         self.shared.written.load(Ordering::Acquire)
     }
@@ -260,7 +273,7 @@ impl Drop for Wal {
 }
 
 impl Shared {
-    fn append(&self, key: &[u8], value: Option<&[u8]>) -> Result<()> {
+    fn append(&self, key: &[u8], value: Option<&[u8]>) -> Result<u64> {
         if let Some(err) = self.take_background_error() {
             return Err(err);
         }
@@ -283,7 +296,7 @@ impl Shared {
         if self.policy == SyncPolicy::Group {
             self.sync_through(seq)?;
         }
-        Ok(())
+        Ok(seq)
     }
 
     /// Returns once record `seq` is durable, flushing if nobody else is.
@@ -608,6 +621,25 @@ mod tests {
         drop(wal);
 
         assert_eq!(records(&path).len(), 100);
+    }
+
+    #[test]
+    fn sequence_numbers_resume_where_the_file_stops() {
+        let dir = TempDir::new();
+        let path = dir.join("wal");
+
+        {
+            let (wal, _) = Wal::recover(&path, SyncPolicy::Group).expect("recover");
+            assert_eq!(wal.set(b"a", b"1").expect("set"), 1);
+            assert_eq!(wal.set(b"b", b"2").expect("set"), 2);
+        }
+
+        let (wal, replayed) = Wal::recover(&path, SyncPolicy::Group).expect("recover");
+        assert_eq!(replayed.len(), 2);
+        assert_eq!(wal.record_count(), 2);
+        // Restarting the numbering here would make a new write look older than
+        // the record it replaces.
+        assert_eq!(wal.set(b"a", b"3").expect("set"), 3);
     }
 
     #[test]

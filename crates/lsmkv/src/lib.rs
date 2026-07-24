@@ -10,10 +10,14 @@
 //! and any async runtime live outside this crate.
 
 mod checksum;
+mod engine;
 pub mod error;
+pub mod memtable;
 #[cfg(test)]
 mod testutil;
 pub mod wal;
 
+pub use engine::Engine;
 pub use error::{Error, Result};
+pub use memtable::{Lookup, Memtable};
 pub use wal::{Record, SyncPolicy, Wal};
