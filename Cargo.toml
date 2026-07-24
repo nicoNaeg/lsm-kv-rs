@@ -1,0 +1,29 @@
+[workspace]
+resolver = "3"
+members = ["crates/lsmkv"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT"
+repository = "https://github.com/nicoNaeg/lsm-kv-rs"
+authors = ["Nicolas Naegelen"]
+
+[workspace.lints.rust]
+missing_docs = "warn"
+# A module that needs unsafe opts out explicitly, with a justification and a
+# Miri or loom test.
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Fire on nearly every public item and buy nothing on an application crate.
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+
+[profile.release]
+# Flamegraphs are taken on release builds and need symbols to resolve.
+debug = true
+lto = "thin"
+codegen-units = 1

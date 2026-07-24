@@ -1,0 +1,15 @@
+# Rust
+/target/
+
+# Engine data and generated artifacts
+/data/
+*.sst
+*.wal
+
+# Profiler output
+/flamegraph.svg
+/perf.data*
+*.stacks
+
+# OS
+.DS_Store
