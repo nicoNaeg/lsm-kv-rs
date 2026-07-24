@@ -27,6 +27,11 @@ pub enum Error {
         /// What the engine expected and what it found.
         detail: String,
     },
+    /// A key or a value is longer than the on-disk format can describe.
+    TooLarge {
+        /// Length that was offered.
+        len: usize,
+    },
 }
 
 impl Error {
@@ -52,6 +57,12 @@ impl fmt::Display for Error {
         match self {
             Self::Io { path, source } => write!(f, "{}: {source}", path.display()),
             Self::Corrupt { path, detail } => write!(f, "{}: corrupt: {detail}", path.display()),
+            Self::TooLarge { len } => {
+                write!(
+                    f,
+                    "{len} bytes exceeds the 4 GiB limit for one key or value"
+                )
+            }
         }
     }
 }
@@ -60,7 +71,7 @@ impl StdError for Error {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
             Self::Io { source, .. } => Some(source),
-            Self::Corrupt { .. } => None,
+            Self::Corrupt { .. } | Self::TooLarge { .. } => None,
         }
     }
 }

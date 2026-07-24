@@ -9,6 +9,11 @@
 //! The engine is synchronous and owns a single data directory. Network serving
 //! and any async runtime live outside this crate.
 
+mod checksum;
 pub mod error;
+#[cfg(test)]
+mod testutil;
+pub mod wal;
 
 pub use error::{Error, Result};
+pub use wal::{Record, SyncPolicy, Wal};
