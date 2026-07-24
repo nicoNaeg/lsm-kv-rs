@@ -4,7 +4,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
-use crate::memtable::{Lookup, Memtable};
+use crate::lookup::Lookup;
+use crate::memtable::Memtable;
 use crate::wal::{Record, SyncPolicy, Wal};
 
 /// Name of the log inside the data directory.

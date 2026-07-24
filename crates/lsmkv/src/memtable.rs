@@ -9,20 +9,11 @@
 use std::collections::BTreeMap;
 use std::sync::RwLock;
 
+use crate::lookup::Lookup;
+
 /// A panic while the table was being modified leaves its size accounting
 /// unusable.
 const POISONED: &str = "a writer panicked while holding the memtable";
-
-/// What a lookup found.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Lookup {
-    /// The key is bound to this value.
-    Found(Vec<u8>),
-    /// A tombstone shadows the key, so older tables must not be consulted.
-    Deleted,
-    /// Nothing here; the search continues in older tables.
-    Missing,
-}
 
 /// The most recent value known for each key, sorted by key.
 #[derive(Debug, Default)]
