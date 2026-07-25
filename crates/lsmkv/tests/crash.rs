@@ -55,8 +55,9 @@ const ITERATIONS_ENV: &str = "LSMKV_CRASH_ITERATIONS";
 const DEFAULT_ITERATIONS: u32 = 30;
 /// Keys past the end of the prefix that are checked to be absent.
 const MARGIN: u64 = 64;
-/// Below this the child never got going and the run proved nothing.
-const MINIMUM_KEYS: u64 = 50;
+/// Below this the child barely ran and the iterations were close to vacuous.
+/// A local run of the default iterations reaches a few thousand.
+const MINIMUM_KEYS: u64 = 400;
 
 /// Sized so the store is almost always mid-flush. This is what gives the test
 /// its power: the window a crash has to land in to expose a bad ordering is a
@@ -103,6 +104,7 @@ fn an_acknowledged_write_survives_a_crash() {
     let mut rng = Rng::new(seed);
 
     let mut highest = 0;
+    let mut levels = 0;
     for iteration in 0..iterations {
         // Long enough to open the store and get several flushes in, short
         // enough that the kill lands while one is in flight rather than after.
@@ -114,14 +116,26 @@ fn an_acknowledged_write_survives_a_crash() {
             kill_after(&dir, Duration::from_millis(1 + rng.below(40)));
         }
 
-        highest = verify(&dir, iteration);
+        let (bound, depth) = verify(&dir, iteration);
+        highest = bound;
+        levels = levels.max(depth);
     }
 
+    // Both of these guard against the run being vacuous rather than correct.
+    // The output of a passing test is captured, so a crash test that quietly
+    // stopped exercising anything would keep reporting success; these turn that
+    // into a failure instead.
     assert!(
         highest >= MINIMUM_KEYS,
-        "only {highest} keys were ever written, so the child never ran and this proved nothing"
+        "only {highest} keys were written across {iterations} iterations, \
+         so the child barely ran and this proved little"
     );
-    println!("{highest} keys survived, prefix intact");
+    assert!(
+        levels > 1,
+        "the store never reached a second level, so no compaction ran and the \
+         crashes landed on flushes at best"
+    );
+    println!("{highest} keys survived across {levels} levels, prefix intact");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -137,8 +151,9 @@ fn write_until_killed(dir: &Path) -> ! {
     }
 }
 
-/// Opens the store and checks the surviving keys are a prefix of the sequence.
-fn verify(dir: &Path, iteration: u32) -> u64 {
+/// Opens the store and checks the surviving keys are a prefix of the sequence,
+/// returning how far the prefix reaches and how deep the tree got.
+fn verify(dir: &Path, iteration: u32) -> (u64, usize) {
     let engine = Engine::open(dir, config())
         .unwrap_or_else(|err| panic!("iteration {iteration}: the store would not reopen: {err}"));
 
@@ -160,7 +175,7 @@ fn verify(dir: &Path, iteration: u32) -> u64 {
              so a write surfaced that was never acknowledged"
         );
     }
-    bound
+    (bound, engine.level_sizes().len())
 }
 
 /// The first key the store does not hold, found by doubling then bisecting.
