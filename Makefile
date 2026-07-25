@@ -1,7 +1,13 @@
-.PHONY: build test lint fmt
+.PHONY: build server bench-server test lint fmt
 
 build:
 	cargo build --release
+
+server: build
+	./target/release/lsmkv-server --dir data
+
+bench-server: build
+	./scripts/bench-server.sh
 
 test:
 	cargo test --all-features

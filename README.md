@@ -184,6 +184,72 @@ The price is 3.61 bytes written per byte ingested, against 1.18. That figure gro
 
 Two details worth naming. The 1.18 of the flushes-only store is not 1.00 because every file carries its index, its filter and its framing on top of the entries. And the mean lookup moves far less than the block reads do, because a key that is present is found in one block read either way: what the flat shape wastes is Bloom probes and page cache, not the read that answers.
 
+## Serving the Redis protocol
+
+    make server
+
+The server speaks RESP2 on port 6379, so `redis-cli` and `redis-benchmark` drive it unchanged:
+
+```console
+$ redis-cli set user:1 nicolas
+OK
+$ redis-cli get user:1
+"nicolas"
+$ redis-cli info
+# Server
+server:lsmkv
+version:0.1.0
+proto:2
+...
+# Engine
+files:12
+files_per_level:0,9,3
+last_sequence:40312
+block_reads:166
+bytes_written:10465948
+```
+
+The command set is `PING`, `GET`, `SET` and `DEL`, plus what the two tools probe when they connect: `COMMAND`, `CONFIG GET`, `HELLO`, `INFO`, `SELECT` and `QUIT`. Anything else gets the error Redis would give rather than a plausible answer this store cannot honour, and that line is drawn on purpose: `SET key value EX 10` is refused rather than silently dropping the expiry, and the Redis data types are absent, which is why the benchmark runs `-t set,get`. `INFO` reports the engine's own counters, the ones the examples above measure. `redis-benchmark` prints `WARNING: Could not fetch server CONFIG` on startup: it asks for parameters this server has none of, and an empty answer is the truthful one.
+
+tokio carries the network, one task per connection, while the store stays synchronous behind `spawn_blocking`. A 3.8 ms device flush on a reactor thread would stall every other connection that thread carries, which is the whole reason the hop exists. The hop is paid per batch and not per command: one read is parsed into as many complete commands as it holds, they run in a single blocking call, and the replies leave in one write.
+
+### Against Redis, same machine, same tool
+
+    ./scripts/bench-server.sh
+
+Apple M4 Pro, macOS 26.5, redis 8.8.1, `redis-benchmark -t set,get -n 20000 -c 50`:
+
+| server | durability of a write | SET/s | GET/s |
+|--------|-----------------------|-------|-------|
+| redis, default | none, memory only | 145985 | 161290 |
+| redis, appendfsync always | `fsync` per write | 6255 | 130718 |
+| lsm-kv-rs, interval 10 ms | log flushed every 10 ms | 67796 | 104712 |
+| lsm-kv-rs, group commit | device flush per write, shared | 3152 | 99009 |
+| lsm-kv-rs, flush per write | device flush per write, serialized | 255 | 99502 |
+
+Read honestly, that table says four things.
+
+Redis is 1.5 times faster on reads and a little over twice on writes at its default settings, which is what a hash table in memory buys against a log, a memtable and a lookup that may reach a file.
+
+The two rows to compare for durability are `appendfsync always` at 6255 and group commit at 3152, and they do not measure the same guarantee: Redis calls `fsync`, which on macOS may leave the write in the drive's own cache, while `sync_data` here issues `F_FULLFSYNC`, which drains it. Half the throughput for a strictly stronger promise.
+
+The 255 writes per second of the serialized policy is the 260 the log benchmark measured on its own at stage 1. The network layer adds nothing measurable, because a 3.8 ms device flush dominates everything else in the path.
+
+And group commit at 3152 writes per second means about twelve appends amortized per device flush with 50 clients, against four with eight writers at stage 1. The batching improves as clients arrive, which is what it is for.
+
+### What pipelining exposes
+
+`redis-benchmark -P 16 -n 200000 -c 50`, interval policy against Redis's default:
+
+| server | SET/s | GET/s |
+|--------|-------|-------|
+| redis, default | 1562499 | 2000000 |
+| lsm-kv-rs, interval 10 ms | 192864 | 1680672 |
+
+On reads this lands within 16 % of Redis, 1.68 million against 2.0 million, which says the batch-per-hop design holds and the read path is not what needs work.
+
+On writes the gap opens to eight times, and it points at exactly what stage 1 predicted: every record is one `write` syscall taken under one append lock. At 192 864 writes per second that is 192 864 syscalls per second, where Redis is appending into a buffer and writing it once per loop. Batching the log writes, one syscall per group rather than one per record, is the next optimization, and it now carries a number instead of an intuition.
+
 ## Build order
 
 Each stage lands with its tests before the next one starts.
@@ -193,11 +259,11 @@ Each stage lands with its tests before the next one starts.
 3. **Sorted files** (built): writer and reader, 4 KiB blocks, sparse index and footer, log rotation and background flush of a full memtable.
 4. **Bloom filters** (built): one per file, so a lookup skips a file that cannot hold the key without touching the disk.
 5. **Compaction** (built): manifest, leveled background merge, tombstone purge.
-6. **Server**: RESP2 subset on tokio, so redis-cli and redis-benchmark drive the engine unchanged.
+6. **Server** (built): RESP2 subset on tokio, so redis-cli and redis-benchmark drive the engine unchanged.
 7. **Benchmarks and profiling**: criterion micro-benchmarks, redis-benchmark end to end, flamegraph of the hot path.
 8. **Skiplist memtable**: hand-written concurrent skiplist measured against the BTreeMap baseline. The memtable interface is extracted then, from two implementations rather than from one.
 
-Current stage: 6.
+Current stage: 7.
 
 ## Benchmarking
 
@@ -214,17 +280,22 @@ Measurements are taken on an Apple M4 Pro, 12 cores, 24 GB unified memory.
 
 ## Repository layout
 
-    crates/lsmkv/    storage engine, synchronous, owns one data directory
-    Makefile         build, test and lint entry points
+    crates/lsmkv/         storage engine, synchronous, owns one data directory
+    crates/lsmkv-server/  RESP2 server on tokio, and the protocol itself
+    scripts/              benchmark drivers
+    Makefile              build, test and lint entry points
 
 ## Development
 
 Requires a stable Rust toolchain; `rust-toolchain.toml` pins the channel and the components.
 
     make build    release build
+    make server   start the server on port 6379 over ./data
     make test     run the test suite
     make lint     rustfmt check, then clippy with warnings denied
     make fmt      format, then apply the clippy fixes
+
+`./scripts/bench-server.sh` compares the server against Redis and needs `redis-benchmark` and `redis-server` on the path (`brew install redis`).
 
 ## License
 
