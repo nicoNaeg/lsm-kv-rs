@@ -25,6 +25,25 @@
 //! across iterations instead of rewriting the same prefix, and later crashes
 //! land on a tree with more levels under it.
 //!
+//! # What this cannot see
+//!
+//! The prefix catches a hole and it catches the end moving backwards, which are
+//! the sharp corruptions. It cannot catch the loss of a contiguous *tail*: a
+//! store that acknowledged up to `k190` and comes back holding `k0..k110` looks
+//! exactly like one whose writer never got past 110, and nothing outside the
+//! store knows which happened, because the only record of how far the writer
+//! got is the store itself.
+//!
+//! What that loss does show up as is retention. A healthy run of the default
+//! iterations keeps a few thousand keys; against an engine with the logs
+//! unlinked before the manifest commit it keeps a few hundred, because most of
+//! what each child writes never survives its crash. The floor below is that
+//! signal, which is why it names the cause rather than only the symptom.
+//!
+//! Catching tail loss directly needs the crash point to be known, so that what
+//! should have survived can be computed. That is deterministic fault injection,
+//! and it is the reason this test does not retire the idea.
+//!
 //! # Why the memtable is tiny
 //!
 //! A random kill only finds an ordering bug if it lands in the window that bug
@@ -55,9 +74,18 @@ const ITERATIONS_ENV: &str = "LSMKV_CRASH_ITERATIONS";
 const DEFAULT_ITERATIONS: u32 = 30;
 /// Keys past the end of the prefix that are checked to be absent.
 const MARGIN: u64 = 64;
-/// Below this the child barely ran and the iterations were close to vacuous.
-/// A local run of the default iterations reaches a few thousand.
-const MINIMUM_KEYS: u64 = 400;
+/// Keys below the end of the prefix checked after every crash. The whole
+/// prefix is walked once at the end instead of every time: a hole never heals,
+/// because each run continues past the end rather than rewriting what is
+/// there, so the last pass sees every hole any iteration opened. Walking it
+/// each time made the test quadratic in a store that is meant to keep growing,
+/// which cost four minutes of CI for nothing.
+const RECENT: u64 = 256;
+/// A healthy run of the default iterations retains a few thousand keys. Falling
+/// far below that means either the child never ran, or it ran and most of what
+/// it acknowledged did not survive its crash, which is the only way this test
+/// sees a lost tail.
+const MINIMUM_KEYS: u64 = 800;
 
 /// Sized so the store is almost always mid-flush. This is what gives the test
 /// its power: the window a crash has to land in to expose a bad ordering is a
@@ -116,7 +144,7 @@ fn an_acknowledged_write_survives_a_crash() {
             kill_after(&dir, Duration::from_millis(1 + rng.below(40)));
         }
 
-        let (bound, depth) = verify(&dir, iteration);
+        let (bound, depth) = verify(&dir, iteration, iteration + 1 == iterations, highest);
         highest = bound;
         levels = levels.max(depth);
     }
@@ -127,8 +155,9 @@ fn an_acknowledged_write_survives_a_crash() {
     // into a failure instead.
     assert!(
         highest >= MINIMUM_KEYS,
-        "only {highest} keys were written across {iterations} iterations, \
-         so the child barely ran and this proved little"
+        "only {highest} keys survived {iterations} iterations, against thousands \
+         on a healthy store. Either the child never ran, or each crash is losing \
+         the tail of what it acknowledged"
     );
     assert!(
         levels > 1,
@@ -153,12 +182,29 @@ fn write_until_killed(dir: &Path) -> ! {
 
 /// Opens the store and checks the surviving keys are a prefix of the sequence,
 /// returning how far the prefix reaches and how deep the tree got.
-fn verify(dir: &Path, iteration: u32) -> (u64, usize) {
+///
+/// `whole` walks the prefix from zero; otherwise only the keys a fresh crash
+/// could have damaged.
+fn verify(dir: &Path, iteration: u32, whole: bool, reached: u64) -> (u64, usize) {
     let engine = Engine::open(dir, config())
         .unwrap_or_else(|err| panic!("iteration {iteration}: the store would not reopen: {err}"));
 
     let bound = first_absent(&engine);
-    for n in 0..bound {
+    // The sharpest form of the invariant, and the cheapest. Every key below the
+    // end of the prefix was acknowledged and durable before the next was
+    // written, and nothing here deletes, so the end can only move forward. A
+    // prefix that shrank is data loss, stated without walking anything.
+    assert!(
+        bound >= reached,
+        "iteration {iteration}: the prefix shrank from {reached} to {bound}, \
+         so writes the store had acknowledged are gone"
+    );
+    let from = if whole {
+        0
+    } else {
+        bound.saturating_sub(RECENT)
+    };
+    for n in from..bound {
         let found = engine.get(&key(n)).expect("get");
         assert_eq!(
             found.as_deref(),
