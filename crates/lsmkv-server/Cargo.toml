@@ -1,0 +1,16 @@
+[package]
+name = "lsmkv-server"
+description = "Redis wire protocol server over the LSM-tree engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+lsmkv = { path = "../lsmkv" }
+tokio = { version = "1.53.1", default-features = false, features = ["rt-multi-thread", "net", "io-util", "macros", "signal"] }

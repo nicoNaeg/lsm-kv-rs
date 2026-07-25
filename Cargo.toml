@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/lsmkv"]
+members = ["crates/lsmkv", "crates/lsmkv-server"]
 
 [workspace.package]
 version = "0.1.0"
