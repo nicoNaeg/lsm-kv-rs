@@ -63,13 +63,29 @@ impl Record {
     }
 }
 
-/// Encodes one record into `buf`, replacing what it held.
+/// Appends one record to `buf`, after whatever it already holds.
 ///
-/// `value` is `None` for a delete.
+/// `value` is `None` for a delete. On failure `buf` is left exactly as it was,
+/// since the records already in it belong to a group that is still going to be
+/// written.
 pub(crate) fn encode(buf: &mut Vec<u8>, seq: u64, key: &[u8], value: Option<&[u8]>) -> Result<()> {
+    let start = buf.len();
+    let encoded = encode_at(buf, start, seq, key, value);
+    if encoded.is_err() {
+        buf.truncate(start);
+    }
+    encoded
+}
+
+fn encode_at(
+    buf: &mut Vec<u8>,
+    start: usize,
+    seq: u64,
+    key: &[u8],
+    value: Option<&[u8]>,
+) -> Result<()> {
     let key_len = length_of(key)?;
 
-    buf.clear();
     buf.extend_from_slice(&[0; HEADER_LEN]);
     buf.extend_from_slice(&seq.to_le_bytes());
     if let Some(value) = value {
@@ -85,10 +101,10 @@ pub(crate) fn encode(buf: &mut Vec<u8>, seq: u64, key: &[u8], value: Option<&[u8
         buf.extend_from_slice(key);
     }
 
-    let payload_len = length_of(&buf[HEADER_LEN..])?;
-    buf[4..8].copy_from_slice(&payload_len.to_le_bytes());
-    let crc = crc32(&buf[4..]);
-    buf[0..4].copy_from_slice(&crc.to_le_bytes());
+    let payload_len = length_of(&buf[start + HEADER_LEN..])?;
+    buf[start + 4..start + 8].copy_from_slice(&payload_len.to_le_bytes());
+    let crc = crc32(&buf[start + 4..]);
+    buf[start..start + 4].copy_from_slice(&crc.to_le_bytes());
     Ok(())
 }
 
@@ -135,6 +151,30 @@ mod tests {
             Record::Delete {
                 seq: 8,
                 key: b"user:1".to_vec(),
+            }
+        );
+    }
+
+    #[test]
+    fn records_encode_back_to_back_in_one_buffer() {
+        let mut buf = Vec::new();
+        encode(&mut buf, 1, b"a", Some(b"1")).expect("encode");
+        let first_len = buf.len();
+        encode(&mut buf, 2, b"b", None).expect("encode");
+
+        assert_eq!(
+            decode(&buf[HEADER_LEN..first_len]).expect("decode the first"),
+            Record::Set {
+                seq: 1,
+                key: b"a".to_vec(),
+                value: b"1".to_vec(),
+            }
+        );
+        assert_eq!(
+            decode(&buf[first_len + HEADER_LEN..]).expect("decode the second"),
+            Record::Delete {
+                seq: 2,
+                key: b"b".to_vec(),
             }
         );
     }

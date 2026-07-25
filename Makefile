@@ -1,4 +1,4 @@
-.PHONY: build server bench-server test lint fmt
+.PHONY: build server bench bench-server flamegraph test lint fmt
 
 build:
 	cargo build --release
@@ -6,8 +6,14 @@ build:
 server: build
 	./target/release/lsmkv-server --dir data
 
+bench:
+	cargo bench
+
 bench-server: build
 	./scripts/bench-server.sh
+
+flamegraph: build
+	./scripts/flamegraph-server.sh
 
 test:
 	cargo test --all-features

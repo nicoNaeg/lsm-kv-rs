@@ -2,9 +2,16 @@
 //! memory, so a crash costs nothing that was acknowledged.
 //!
 //! The file starts with a magic and a format version, then holds records back
-//! to back. Appends are serialized by one lock and go straight to the file, one
-//! write syscall each; how often those bytes are pushed to the device is set by
-//! [`SyncPolicy`].
+//! to back. Appends are serialized by one lock, which encodes them into a
+//! shared buffer; whoever flushes writes that buffer out in one syscall, so a
+//! batch of concurrent appends costs one `write` and one device flush rather
+//! than one of each per record. How often those bytes are pushed to the device
+//! is set by [`SyncPolicy`].
+//!
+//! No thread ever holds the append lock and the sync lock at the same time: an
+//! appender takes the first and releases it before waiting on the second, and
+//! the writer that owns a flush releases the sync lock before taking the append
+//! lock to drain the buffer.
 //!
 //! Recovery reads the file back with [`Wal::recover`], which drops a torn tail
 //! (a record a crash interrupted mid-write) before the log is reopened for
@@ -17,9 +24,9 @@ pub use reader::Replay;
 pub use record::Record;
 
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -34,9 +41,19 @@ const FILE_HEADER_LEN_U64: u64 = FILE_HEADER_LEN as u64;
 
 const _: () = assert!(MAGIC.len() + 4 == FILE_HEADER_LEN);
 
-/// A panic while the append lock was held leaves a half-written record behind,
-/// after which nothing appended can be recovered.
+/// How many bytes of encoded records may wait in memory before an append writes
+/// them out itself. Under [`SyncPolicy::Interval`] nothing else bounds the
+/// buffer between two background flushes, so this is what keeps the window a
+/// crash can lose bounded in bytes as well as in time.
+const MAX_PENDING_BYTES: usize = 64 * 1024;
+
+/// A panic while the append lock was held can leave a half-encoded record in
+/// the buffer the other writers share, after which nothing appended can be
+/// recovered.
 const POISONED: &str = "a writer panicked while appending to the log";
+
+/// Reported by every append once a write has failed.
+const WRITE_FAILED: &str = "the log stopped accepting appends after a failed write";
 
 /// When appended bytes are pushed to the device.
 ///
@@ -74,18 +91,31 @@ struct Shared {
     path: PathBuf,
     file: File,
     policy: SyncPolicy,
-    /// Serializes appends and carries the encoding buffer they reuse.
-    append: Mutex<Vec<u8>>,
-    /// Sequence number of the last record whose bytes reached the operating
-    /// system. Bumped under the append lock, read without it.
+    /// Serializes appends and carries the records they have encoded but not yet
+    /// handed to the operating system.
+    append: Mutex<Pending>,
+    /// Sequence number of the last record encoded. Bumped under the append
+    /// lock, read without it, so it is stable for anyone holding that lock.
     last_seq: AtomicU64,
     sync: Mutex<SyncState>,
     synced: Condvar,
+    writes: AtomicU64,
     flushes: AtomicU64,
+    /// Set once a write fails, after which the log refuses to append.
+    failed: AtomicBool,
     /// Failure of a background flush, reported on the next call that can.
     background_error: Mutex<Option<Error>>,
     shutdown: Mutex<bool>,
     stopping: Condvar,
+}
+
+/// Records encoded and waiting for the write that will carry them out.
+#[derive(Debug)]
+struct Pending {
+    buf: Vec<u8>,
+    /// Sequence number of the last record the file has taken. Everything above
+    /// it and up to `last_seq` is what `buf` holds.
+    written: u64,
 }
 
 #[derive(Debug, Default)]
@@ -187,14 +217,19 @@ impl Wal {
             path,
             file,
             policy,
-            append: Mutex::new(Vec::new()),
+            append: Mutex::new(Pending {
+                buf: Vec::new(),
+                written: last_seq,
+            }),
             last_seq: AtomicU64::new(last_seq),
             sync: Mutex::new(SyncState {
                 durable: last_seq,
                 in_progress: false,
             }),
             synced: Condvar::new(),
+            writes: AtomicU64::new(0),
             flushes: AtomicU64::new(0),
+            failed: AtomicBool::new(false),
             background_error: Mutex::new(None),
             shutdown: Mutex::new(false),
             stopping: Condvar::new(),
@@ -261,6 +296,14 @@ impl Wal {
         self.shared.flushes.load(Ordering::Relaxed)
     }
 
+    /// `write` syscalls issued since the log was opened.
+    ///
+    /// The ratio of appends to writes is what batching buys, measured the same
+    /// way as [`Wal::flush_count`] rather than assumed.
+    pub fn write_count(&self) -> u64 {
+        self.shared.writes.load(Ordering::Relaxed)
+    }
+
     /// Highest sequence number this log has handed out, replayed records
     /// included. The next append gets the one after it.
     pub fn last_sequence(&self) -> u64 {
@@ -290,8 +333,10 @@ impl Drop for Wal {
             let _ = syncer.join();
         }
         // Best effort: a failure here has nobody to report to, which is why
-        // callers that need the guarantee call sync() first.
-        let _ = self.shared.flush();
+        // callers that need the guarantee call sync() first. Records still in
+        // the buffer have to reach the file before it is flushed, or closing
+        // the log would drop them.
+        let _ = self.shared.write_and_flush();
     }
 }
 
@@ -300,21 +345,26 @@ impl Shared {
         if let Some(err) = self.take_background_error() {
             return Err(err);
         }
+        if self.failed.load(Ordering::Acquire) {
+            return Err(Error::io(&self.path, io::Error::other(WRITE_FAILED)));
+        }
 
         let seq = {
-            let mut buf = self.append.lock().expect(POISONED);
+            let mut pending = self.append.lock().expect(POISONED);
             // Only one appender at a time, so reading the counter and bumping
             // it below cannot race.
             let seq = self.last_seq.load(Ordering::Relaxed) + 1;
-            record::encode(&mut buf, seq, key, value)?;
-            (&self.file)
-                .write_all(&buf)
-                .map_err(|err| Error::io(&self.path, err))?;
+            record::encode(&mut pending.buf, seq, key, value)?;
             self.last_seq.store(seq, Ordering::Release);
+
             if self.policy == SyncPolicy::Always {
-                // Held on purpose: one flush per append, serialized behind the
-                // append lock, is exactly what this policy promises.
+                // Held on purpose: one write and one flush per append,
+                // serialized behind the append lock, is exactly what this
+                // policy promises.
+                self.write_pending(&mut pending)?;
                 self.flush()?;
+            } else if pending.buf.len() >= MAX_PENDING_BYTES {
+                self.write_pending(&mut pending)?;
             }
             seq
         };
@@ -325,35 +375,81 @@ impl Shared {
         Ok(seq)
     }
 
-    /// Returns once record `seq` is durable, flushing if nobody else is.
+    /// Returns once record `seq` is durable, writing and flushing if nobody
+    /// else is.
     fn sync_through(&self, seq: u64) -> Result<()> {
         let mut state = self.sync.lock().expect(POISONED);
         loop {
             if state.durable >= seq {
                 return Ok(());
             }
+            if self.failed.load(Ordering::Acquire) {
+                // The write that would have carried this record out failed, so
+                // no later flush can make it durable and waiting for one would
+                // never end.
+                return Err(Error::io(&self.path, io::Error::other(WRITE_FAILED)));
+            }
             if state.in_progress {
                 state = self.synced.wait(state).expect(POISONED);
                 continue;
             }
 
-            // This thread owns the next flush. It covers every record written
-            // so far, which includes its own and everything appended by the
-            // writers that will wait on it.
-            let target = self.last_seq.load(Ordering::Acquire);
+            // This thread owns the next flush. The sync lock is released before
+            // the append lock is taken, so the writers that keep encoding while
+            // this one waits on the device join the round after it.
             state.in_progress = true;
             drop(state);
 
-            let flushed = self.flush();
+            let flushed = self.write_and_flush();
 
             state = self.sync.lock().expect(POISONED);
             state.in_progress = false;
-            if flushed.is_ok() {
+            if let Ok(target) = flushed {
+                // Only what the write actually carried out, not what has been
+                // encoded since.
                 state.durable = state.durable.max(target);
             }
             self.synced.notify_all();
             flushed?;
         }
+    }
+
+    /// Writes the buffered records and pushes them to the device, returning the
+    /// sequence number the pair covered.
+    fn write_and_flush(&self) -> Result<u64> {
+        let target = {
+            let mut pending = self.append.lock().expect(POISONED);
+            self.write_pending(&mut pending)?;
+            pending.written
+        };
+        self.flush()?;
+        Ok(target)
+    }
+
+    /// Hands every buffered record to the operating system, in one syscall.
+    fn write_pending(&self, pending: &mut Pending) -> Result<()> {
+        if pending.buf.is_empty() {
+            return Ok(());
+        }
+
+        self.writes.fetch_add(1, Ordering::Relaxed);
+        let written = (&self.file)
+            .write_all(&pending.buf)
+            .map_err(|err| Error::io(&self.path, err));
+        // Dropped either way: a failed write_all leaves an unknown prefix in
+        // the file, and writing those bytes again would duplicate it.
+        pending.buf.clear();
+
+        if written.is_err() {
+            // Whatever the file took is a partial record, so every later append
+            // would sit behind bytes recovery refuses to read. Refusing them is
+            // the same loss, reported instead of silent.
+            self.failed.store(true, Ordering::Release);
+            return written;
+        }
+        // The append lock is held, so nothing has been encoded past this.
+        pending.written = self.last_seq.load(Ordering::Relaxed);
+        Ok(())
     }
 
     fn flush(&self) -> Result<()> {
@@ -590,7 +686,7 @@ mod tests {
     }
 
     #[test]
-    fn every_append_flushes_under_always() {
+    fn every_append_writes_and_flushes_under_always() {
         let dir = TempDir::new();
         let path = dir.join("wal");
         let (wal, _) = Wal::recover(&path, SyncPolicy::Always, 0).expect("recover");
@@ -600,10 +696,12 @@ mod tests {
         }
 
         assert_eq!(wal.flush_count(), 10);
+        // Nothing to batch when every append is flushed on its own.
+        assert_eq!(wal.write_count(), 10);
     }
 
     #[test]
-    fn group_commit_amortizes_flushes_across_concurrent_writers() {
+    fn group_commit_amortizes_writes_and_flushes_across_concurrent_writers() {
         const WRITERS: usize = 8;
         const PER_WRITER: usize = 200;
 
@@ -633,9 +731,62 @@ mod tests {
             "{} flushes for {appends} appends, nothing was amortized",
             wal.flush_count()
         );
+        assert!(
+            wal.write_count() < appends,
+            "{} writes for {appends} appends, the batch never formed",
+            wal.write_count()
+        );
         drop(wal);
 
         assert_eq!(records(&path).len(), WRITERS * PER_WRITER);
+    }
+
+    #[test]
+    fn a_full_buffer_is_written_before_anything_asks_for_a_flush() {
+        const APPENDS: usize = 2000;
+        const VALUE: [u8; 100] = [b'v'; 100];
+
+        let dir = TempDir::new();
+        let path = dir.join("wal");
+        // Long enough that the background thread cannot be what empties the
+        // buffer during the test.
+        let (wal, _) =
+            Wal::recover(&path, SyncPolicy::Interval(Duration::from_secs(30)), 0).expect("recover");
+
+        for i in 0..APPENDS {
+            wal.set(&(i as u64).to_be_bytes(), &VALUE).expect("set");
+        }
+
+        let buffered = APPENDS * (VALUE.len() + 8);
+        assert!(
+            buffered > MAX_PENDING_BYTES,
+            "the test has to append more than the cap to exercise it"
+        );
+        assert!(
+            wal.write_count() >= (buffered / MAX_PENDING_BYTES) as u64,
+            "{} writes, the cap did not force any",
+            wal.write_count()
+        );
+        assert_eq!(wal.flush_count(), 0, "nothing asked for a flush");
+        drop(wal);
+
+        assert_eq!(records(&path).len(), APPENDS);
+    }
+
+    #[test]
+    fn a_batch_still_in_the_buffer_reaches_the_file_when_the_log_closes() {
+        let dir = TempDir::new();
+        let path = dir.join("wal");
+
+        {
+            let (wal, _) = Wal::recover(&path, SyncPolicy::Interval(Duration::from_secs(30)), 0)
+                .expect("recover");
+            wal.set(b"a", b"1").expect("set");
+            wal.set(b"b", b"2").expect("set");
+            assert_eq!(wal.write_count(), 0, "the batch is still in memory");
+        }
+
+        assert_eq!(records(&path).len(), 2);
     }
 
     #[test]

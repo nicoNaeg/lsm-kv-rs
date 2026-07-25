@@ -49,24 +49,55 @@ Recovery replays the file and stops at the first record that is not complete and
 - `Group` lets appends that arrive while a flush is in flight share the next one, so a single round trip covers everything the concurrent writers appended. The guarantee is identical to `Always`. This is group commit, as in RocksDB and PostgreSQL, and it is the default.
 - `Interval` flushes from a background thread. Appends never wait, and a crash loses at most the records written since the last flush.
 
-Apple M4 Pro, 12 cores, macOS 26.5. Keys of 16 bytes, values of 100, each configuration capped at 100k appends or 3 seconds:
+Apple M4 Pro, 12 cores, macOS 26.5. Keys of 16 bytes, values of 100, each configuration capped at 1M appends or 3 seconds:
 
     cargo run --release --example wal_bench
 
-| policy | threads | appends | flushes | appends per flush | appends/s | mean latency |
-|--------|---------|---------|---------|-------------------|-----------|--------------|
-| always | 1 | 800 | 801 | 1.0 | 262 | 3815 µs |
-| always | 8 | 912 | 913 | 1.0 | 260 | 30746 µs |
-| group | 1 | 800 | 800 | 1.0 | 261 | 3828 µs |
-| group | 8 | 3200 | 796 | 4.0 | 1036 | 7722 µs |
-| interval 10ms | 1 | 100000 | 12 | 8333.3 | 518361 | 2 µs |
-| interval 10ms | 8 | 100000 | 23 | 4347.8 | 265941 | 30 µs |
+| policy | threads | appends | writes | flushes | appends per write | appends per flush | appends/s | mean latency |
+|--------|---------|---------|--------|---------|-------------------|-------------------|-----------|--------------|
+| always | 1 | 784 | 784 | 785 | 1.0 | 1.0 | 260 | 3846 µs |
+| always | 8 | 896 | 896 | 897 | 1.0 | 1.0 | 259 | 30830 µs |
+| group | 1 | 784 | 784 | 784 | 1.0 | 1.0 | 261 | 3838 µs |
+| group | 8 | 3664 | 791 | 791 | 4.6 | 4.6 | 1179 | 6784 µs |
+| interval 10ms | 1 | 1000000 | 2162 | 19 | 462.5 | 52631.6 | 3030703 | 0.33 µs |
+| interval 10ms | 8 | 1000000 | 2175 | 42 | 459.8 | 23809.5 | 1481473 | 5.40 µs |
 
 On macOS, `File::sync_data` issues `F_FULLFSYNC`, which drains the drive's own write cache: 3.8 ms per flush here. The same code on Linux calls `fdatasync`, an order of magnitude cheaper, so these are the pessimistic numbers.
 
-Adding writers does nothing for `Always` (262 against 260 appends/s) because every append holds the log while it waits for the device. `Group` is identical with one writer, since there is nothing to share, and just under four times faster with eight, at an unchanged guarantee: per-append latency drops from 31 ms to 7.7 ms.
+Adding writers does nothing for `Always` (261 against 259 appends/s) because every append holds the log while it waits for the device. `Group` is identical with one writer, since there is nothing to share, and 4.5 times faster with eight, at an unchanged guarantee: per-append latency drops from 31 ms to 6.8 ms.
 
-Two results are worth more than the headline. Group commit batches 4 appends per flush where 8 are available, because the writer that owns a round starts the next flush before the writers it just released have queued their next record; holding a round open for a few microseconds, the commit delay of PostgreSQL, should close that gap and will be measured rather than assumed. And `Interval` is slower with eight writers than with one (266k against 518k appends/s): once the device is out of the way, the single append lock and its one write syscall per record become the bottleneck. That is the first thing the profiling stage will look at.
+### Batching the writes
+
+The `writes` column above is the result of the one optimization stage 7 was pointed at, and it is worth showing where the pointer came from. Stage 1 measured `Interval` as *slower* with eight writers than with one, 243k against 565k appends per second: once the device is out of the way, what remains is one `write` syscall per record taken under one append lock. Stage 6 put a second number on the same thing, 192 864 pipelined writes per second over TCP, which is 192 864 syscalls per second.
+
+The profile is where the intuition got corrected.
+
+    ./scripts/flamegraph-server.sh docs/flamegraph-write-path-before.svg
+
+[The flamegraph before the change](docs/flamegraph-write-path-before.svg), same load, does not say what those two numbers suggest. The `write` syscall itself is 1.5 % of the samples. What holds 96.6 % of them is `__psynch_mutexwait` under `wal::Shared::append`: blocking-pool threads queued on the append lock, waiting for whichever one holds it to come back from its syscall.
+
+That distinction is the reason to take a profile rather than reason about one. The syscall was never expensive on its own, at roughly 3 µs. It was expensive because it sat inside the section every writer passes through, so its cost was paid once per record and then multiplied by everyone waiting behind it. The fix is not to make the write cheaper. It is to take it out of the critical section.
+
+That fix is the same shape as the group commit already there. An append encodes its record into a buffer shared by every writer and returns; whoever owns the next flush writes that whole buffer out in one syscall, then flushes it. A batch of concurrent appends costs one `write` and one `F_FULLFSYNC` rather than one of each per record. The buffer is capped at 64 KiB, so under `Interval`, where nothing else empties it between two background flushes, the window a crash can lose stays bounded in bytes as well as in time.
+
+[The flamegraph after](docs/flamegraph-write-path-after.svg) is the same load on the same machine: the append lock wait is down to 8.4 % of samples, and the largest remaining blocks are blocking-pool threads parked with nothing left to do. The two profiles are read as shares and not as counts, because a thread blocked on a lock is sampled exactly like a thread doing work, which is precisely what made the first one legible.
+
+Same machine, same benchmark, same 1M cap, before and after:
+
+| policy | threads | before | after | |
+|---------|---------|--------|-------|-|
+| always | 1 | 261 | 260 | unchanged |
+| always | 8 | 259 | 259 | unchanged |
+| group | 1 | 261 | 261 | unchanged |
+| group | 8 | 1040 | 1179 | 1.13x |
+| interval 10ms | 1 | 564658 | 3030703 | 5.4x |
+| interval 10ms | 8 | 242801 | 1481473 | 6.1x |
+
+`Always` and single-writer `Group` are unchanged, which is the check that the change did nothing but remove syscalls: with one record in flight there is no batch to form, and the device flush is 99.99% of the cost anyway. Where a batch does form, one write now carries 460 records.
+
+The eight-writer `Group` gain is a side effect worth naming: appends per flush rose from 4.0 to 4.6 without any commit delay being added. A writer that no longer holds the append lock across a syscall releases it sooner, so more writers reach the queue before the round closes. That is a partial answer to the open question stage 1 left, whether a PostgreSQL-style commit delay is needed to fill the rounds.
+
+What did not change is the shape: `Interval` is still slower with eight writers than with one, 1.48M against 3.03M. The syscall is gone from the critical section but the single append lock is not, and that is now the next thing to attack rather than a guess about it.
 
 ## Memtable and engine
 
@@ -87,6 +118,30 @@ Each entry carries the sequence number the log gave its record, and an entry is 
 
 A delete writes a tombstone instead of erasing the entry, because the key may still live in an older file on disk. The tombstone is what shadows it until compaction drops both.
 
+### What one lock costs
+
+    cargo bench --bench memtable
+
+A table already holding 100k entries, keys of 16 bytes and values of 100. Inserts are timed in batches of 10 000 against a table rebuilt outside the timed section, so the number is the structure and not the memory pressure of an unbounded run:
+
+| operation | per operation |
+|-----------|---------------|
+| get, hit | 67.7 ns |
+| get, miss | 71.3 ns |
+| insert into an empty table | 138 ns |
+| insert into a table of 100k | 183 ns |
+
+Those are the uncontended numbers. The one that matters is what happens when readers are running against the same table:
+
+| readers hammering `get` | per insert | against no readers |
+|-------------------------|------------|--------------------|
+| 0 | 77.8 ns | |
+| 1 | 259 ns | 3.3x |
+| 4 | 910 ns | 12x |
+| 8 | 3.70 µs | 48x |
+
+One concurrent reader more than triples the cost of an insert, and eight multiply it by 48. This is not contention in the usual sense, it is the writer being starved: a reader-preferring `RwLock` lets a steady stream of readers hold the shared lock continuously, and the writer waits for a gap between them. The absolute numbers stay small next to a 3.8 ms device flush, so nothing here is the bottleneck today, but this is the specific shape a lock-free structure removes, and it is the baseline stage 8 measures its skiplist against.
+
 ## Sorted files on disk
 
 A memtable that passes its size limit is frozen and a fresh log is started, then a background thread writes the frozen table out as a sorted file. Writes keep landing in the new table while that happens, which is the point of freezing rather than blocking.
@@ -105,6 +160,17 @@ Blocks are 4 KiB, the default of LevelDB and RocksDB, because this workload is p
 The checksum covers a block, which is also the unit of I/O: 4 bytes per 4 KiB, one verification amortized over the tens of records a block holds. Per record it would cost 3.4% of the file and a checksum per record read; per file it could not be verified without reading everything.
 
 Keys are stored whole. Prefix compression pays exactly as much as the key distribution allows and there is no measurement yet, so it is a candidate for the profiling stage, with file size and lookup latency measured before and after rather than assumed.
+
+    cargo bench --bench sstable
+
+A file of 100 000 entries, read back while it is still in the page cache, so this is the cost of the format and not of the device:
+
+| lookup | cost |
+|--------|------|
+| key present | 7.52 µs |
+| key absent, inside the file's key range | 94.0 ns |
+
+The gap is the Bloom filter: an absent key is answered from memory 80 times cheaper than the block read a present key needs. The 7.52 µs is the number to be curious about, since nothing in it touches the disk. It covers the positional read of one 4 KiB block, the CRC-32 over those 4 KiB and the scan inside the block. Which of the three dominates is not measured yet, and the hand-written table-driven CRC-32 is the obvious suspect: that is the next flamegraph, and the reason `CRC-32C` with the ARM64 hardware instruction is on the list rather than already done.
 
 ### What a crash during a flush must not cost
 
@@ -138,6 +204,20 @@ Over 36 000 keys, the number a 4 MiB memtable holds, with 200 000 lookups for ke
 | 16 | 11 | 70 KiB | 0.05 % | 0.05 % |
 
 The measured rates land on the theory within a few hundredths of a point, and that agreement is the interesting result: it says the hand-written hash distributes well enough for the analysis to apply. A weak hash shows up here as a measured rate above the theoretical one. The choice of 10 bits is where the returns start falling off: 8 bits saves 8 KiB per file and costs 2.7 times the wasted reads, 16 bits spends 27 KiB more to remove another 0.75 % of lookups.
+
+What a probe costs is the other half of that trade:
+
+    cargo bench --bench bloom
+
+| bits per key | probes | probe, key present | probe, key absent |
+|--------------|--------|--------------------|-------------------|
+| 8 | 6 | 15.9 ns | 26.3 ns |
+| 10 | 7 | 17.8 ns | 25.6 ns |
+| 16 | 11 | 23.1 ns | 27.3 ns |
+
+Hashing one key is 1.70 ns of that, paid once whatever the probe count. Going from 6 probes to 11 costs 7.2 ns on a present key, about 1.4 ns per extra probe, which is a memory read and not a hash: that is the double hashing doing what it was chosen for, and it means the bits-per-key choice above is a memory decision rather than a CPU one.
+
+One result is not explained yet. An absent key should be the *cheaper* case, since the probe loop stops at the first clear bit instead of running to the end, and it measures slower at 8 and 10 bits per key. The likely cause is that the loop exits at a predictable place on a present key and an unpredictable one on an absent key, but that is a hypothesis, and a hypothesis is not a finding. What the number does settle is the one the read path cares about: rejecting a file costs 26 ns against the 7.5 µs of the block read it saves.
 
 The same run then measures the store itself. It writes 6000 keys in a scattered order so the eleven files that come out overlap in key range instead of partitioning it, which is both what a real workload produces and the case where the filters matter, since every file then has to be consulted:
 
@@ -221,21 +301,21 @@ Apple M4 Pro, macOS 26.5, redis 8.8.1, `redis-benchmark -t set,get -n 20000 -c 5
 
 | server | durability of a write | SET/s | GET/s |
 |--------|-----------------------|-------|-------|
-| redis, default | none, memory only | 145985 | 161290 |
-| redis, appendfsync always | `fsync` per write | 6255 | 130718 |
-| lsm-kv-rs, interval 10 ms | log flushed every 10 ms | 67796 | 104712 |
-| lsm-kv-rs, group commit | device flush per write, shared | 3152 | 99009 |
-| lsm-kv-rs, flush per write | device flush per write, serialized | 255 | 99502 |
+| redis, default | none, memory only | 141843 | 157480 |
+| redis, appendfsync always | `fsync` per write | 6242 | 126582 |
+| lsm-kv-rs, interval 10 ms | log flushed every 10 ms | 99009 | 98522 |
+| lsm-kv-rs, group commit | device flush per write, shared | 6387 | 101522 |
+| lsm-kv-rs, flush per write | device flush per write, serialized | 255 | 100502 |
 
 Read honestly, that table says four things.
 
-Redis is 1.5 times faster on reads and a little over twice on writes at its default settings, which is what a hash table in memory buys against a log, a memtable and a lookup that may reach a file.
+Redis is 1.6 times faster on reads and 1.4 times on writes at its default settings, which is what a hash table in memory buys against a log, a memtable and a lookup that may reach a file.
 
-The two rows to compare for durability are `appendfsync always` at 6255 and group commit at 3152, and they do not measure the same guarantee: Redis calls `fsync`, which on macOS may leave the write in the drive's own cache, while `sync_data` here issues `F_FULLFSYNC`, which drains it. Half the throughput for a strictly stronger promise.
+The two rows to compare for durability are `appendfsync always` at 6242 and group commit at 6387, and they do not measure the same guarantee: Redis calls `fsync`, which on macOS may leave the write in the drive's own cache, while `sync_data` here issues `F_FULLFSYNC`, which drains it. Equal throughput for a strictly stronger promise, where before the log batching it was half.
 
-The 255 writes per second of the serialized policy is the 260 the log benchmark measured on its own at stage 1. The network layer adds nothing measurable, because a 3.8 ms device flush dominates everything else in the path.
+The 255 writes per second of the serialized policy is the 260 the log benchmark measures on its own. The network layer adds nothing measurable, because a 3.8 ms device flush dominates everything else in the path.
 
-And group commit at 3152 writes per second means about twelve appends amortized per device flush with 50 clients, against four with eight writers at stage 1. The batching improves as clients arrive, which is what it is for.
+And group commit at 6387 writes per second means about 25 appends amortized per device flush with 50 clients, against 4.6 with eight writers in the log benchmark. The batching improves as clients arrive, which is what it is for.
 
 ### What pipelining exposes
 
@@ -243,12 +323,12 @@ And group commit at 3152 writes per second means about twelve appends amortized 
 
 | server | SET/s | GET/s |
 |--------|-------|-------|
-| redis, default | 1562499 | 2000000 |
-| lsm-kv-rs, interval 10 ms | 192864 | 1680672 |
+| redis, default | 1587301 | 1960784 |
+| lsm-kv-rs, interval 10 ms | 1142857 | 1652892 |
 
-On reads this lands within 16 % of Redis, 1.68 million against 2.0 million, which says the batch-per-hop design holds and the read path is not what needs work.
+On reads this lands within 16 % of Redis, 1.65 million against 1.96 million, which says the batch-per-hop design holds and the read path is not what needs work.
 
-On writes the gap opens to eight times, and it points at exactly what stage 1 predicted: every record is one `write` syscall taken under one append lock. At 192 864 writes per second that is 192 864 syscalls per second, where Redis is appending into a buffer and writing it once per loop. Batching the log writes, one syscall per group rather than one per record, is the next optimization, and it now carries a number instead of an intuition.
+Writes were the interesting number here before stage 7: 192 864 per second, an eight-fold gap, and the reason was one `write` syscall per record under one append lock. Batching those writes closed most of it. At 1.14 million against Redis's 1.59 million the store is within 28 % on writes it is still logging to disk, against a Redis that is not.
 
 ## Build order
 
@@ -260,42 +340,44 @@ Each stage lands with its tests before the next one starts.
 4. **Bloom filters** (built): one per file, so a lookup skips a file that cannot hold the key without touching the disk.
 5. **Compaction** (built): manifest, leveled background merge, tombstone purge.
 6. **Server** (built): RESP2 subset on tokio, so redis-cli and redis-benchmark drive the engine unchanged.
-7. **Benchmarks and profiling**: criterion micro-benchmarks, redis-benchmark end to end, flamegraph of the hot path.
+7. **Benchmarks and profiling** (built): criterion micro-benchmarks, redis-benchmark end to end, flamegraph of the write path, and the log batching it pointed at.
 8. **Skiplist memtable**: hand-written concurrent skiplist measured against the BTreeMap baseline. The memtable interface is extracted then, from two implementations rather than from one.
 
-Current stage: 7.
+Current stage: 8.
 
 ## Benchmarking
 
-Two levels, both committed and rerunnable:
+Three levels, all committed and rerunnable:
 
-- criterion micro-benchmarks isolate one structure at a time: memtable insert and lookup under concurrent readers, SSTable block read, Bloom filter probe cost.
+- criterion micro-benchmarks isolate one structure at a time: `cargo bench`, reported above.
+- each stage ships the measurement that shaped its design as an example anyone can rerun, `cargo run --release --example wal_bench` for the log, `--example compaction` for the levels, `--example bloom_fp` for the filters.
 - `redis-benchmark` measures the whole path over TCP with the same tool and flags people point at Redis, so the result can be compared to Redis running on the same machine.
 
-On top of those, each stage ships the measurement that shaped its design as an example anyone can rerun, `cargo run --release --example wal_bench` for the log.
-
-Profiling uses cargo-flamegraph on a release build that keeps its symbols. A flamegraph that motivated an optimization is committed under `docs/`, next to the numbers it explains.
+Profiling runs on a release build that keeps its symbols. `./scripts/flamegraph-server.sh` samples the server under a write load with the `sample` tool macOS ships, folds the stacks with inferno and demangles them with rustfilt (`cargo install inferno rustfilt`). No root and no Xcode: cargo-flamegraph would be the usual choice, but its macOS backend now goes through `xctrace`, which needs a full Xcode install rather than the command line tools. A flamegraph that motivated an optimization is committed under `docs/`, next to the numbers it explains.
 
 Measurements are taken on an Apple M4 Pro, 12 cores, 24 GB unified memory.
 
 ## Repository layout
 
     crates/lsmkv/         storage engine, synchronous, owns one data directory
+    crates/lsmkv/benches/ criterion micro-benchmarks, one file per structure
     crates/lsmkv-server/  RESP2 server on tokio, and the protocol itself
-    scripts/              benchmark drivers
+    docs/                 flamegraphs the README cites
+    scripts/              benchmark and profiling drivers
     Makefile              build, test and lint entry points
 
 ## Development
 
 Requires a stable Rust toolchain; `rust-toolchain.toml` pins the channel and the components.
 
-    make build    release build
-    make server   start the server on port 6379 over ./data
-    make test     run the test suite
-    make lint     rustfmt check, then clippy with warnings denied
-    make fmt      format, then apply the clippy fixes
+    make build       release build
+    make server      start the server on port 6379 over ./data
+    make test        run the test suite
+    make bench       run the criterion micro-benchmarks
+    make lint        rustfmt check, then clippy with warnings denied
+    make fmt         format, then apply the clippy fixes
 
-`./scripts/bench-server.sh` compares the server against Redis and needs `redis-benchmark` and `redis-server` on the path (`brew install redis`).
+`./scripts/bench-server.sh` compares the server against Redis and needs `redis-benchmark` and `redis-server` on the path (`brew install redis`). `make flamegraph` profiles the server under a write load and needs `cargo install inferno rustfilt`.
 
 ## License
 

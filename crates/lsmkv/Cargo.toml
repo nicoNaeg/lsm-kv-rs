@@ -12,3 +12,18 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+
+[dev-dependencies]
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "memtable"
+harness = false
+
+[[bench]]
+name = "sstable"
+harness = false
+
+[[bench]]
+name = "bloom"
+harness = false

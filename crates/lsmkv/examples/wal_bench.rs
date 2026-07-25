@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use lsmkv::{SyncPolicy, Wal};
 
 const VALUE_SIZE: usize = 100;
-const MAX_APPENDS: u64 = 100_000;
+const MAX_APPENDS: u64 = 1_000_000;
 const MAX_TIME: Duration = Duration::from_secs(3);
 const THREAD_COUNTS: [usize; 2] = [1, 8];
 
@@ -25,6 +25,7 @@ struct Measurement {
     policy: &'static str,
     threads: usize,
     appends: u64,
+    writes: u64,
     flushes: u64,
     elapsed: Duration,
 }
@@ -90,6 +91,7 @@ fn measure(policy: &'static str, sync: SyncPolicy, threads: usize, path: &Path) 
         policy,
         threads,
         appends: appends.load(Ordering::Relaxed),
+        writes: wal.write_count(),
         flushes: wal.flush_count(),
         elapsed: started.elapsed(),
     }
@@ -99,19 +101,35 @@ fn measure(policy: &'static str, sync: SyncPolicy, threads: usize, path: &Path) 
 #[allow(clippy::cast_precision_loss)]
 fn report(results: &[Measurement]) {
     println!(
-        "| policy | threads | appends | flushes | appends per flush | appends/s | mean latency |"
+        "| policy | threads | appends | writes | flushes | appends per write | appends per flush | appends/s | mean latency |"
     );
     println!(
-        "|--------|---------|---------|---------|-------------------|-----------|--------------|"
+        "|--------|---------|---------|--------|---------|-------------------|-------------------|-----------|--------------|"
     );
     for m in results {
         let seconds = m.elapsed.as_secs_f64();
         let per_second = m.appends as f64 / seconds;
+        let per_write = m.appends as f64 / m.writes as f64;
         let per_flush = m.appends as f64 / m.flushes as f64;
         let latency_us = seconds * 1e6 * m.threads as f64 / m.appends as f64;
+        // A policy that never waits on the device lands under a microsecond,
+        // where a whole number says nothing.
+        let latency = if latency_us < 10.0 {
+            format!("{latency_us:.2} µs")
+        } else {
+            format!("{latency_us:.0} µs")
+        };
         println!(
-            "| {} | {} | {} | {} | {:.1} | {:.0} | {:.0} µs |",
-            m.policy, m.threads, m.appends, m.flushes, per_flush, per_second, latency_us
+            "| {} | {} | {} | {} | {} | {:.1} | {:.1} | {:.0} | {} |",
+            m.policy,
+            m.threads,
+            m.appends,
+            m.writes,
+            m.flushes,
+            per_write,
+            per_flush,
+            per_second,
+            latency
         );
     }
 }
