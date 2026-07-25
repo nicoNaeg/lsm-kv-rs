@@ -209,16 +209,18 @@ A file of 100 000 entries, read back while it is still in the page cache, so thi
 
 | lookup | cost |
 |--------|------|
-| key present | 7.52 µs |
-| key absent, inside the file's key range | 94.0 ns |
+| key present | 2.13 µs |
+| key absent, inside the file's key range | 51.8 ns |
 
-The gap is the Bloom filter: an absent key is answered from memory 80 times cheaper than the block read a present key needs. The 7.5 µs is the number to be curious about, since nothing in it touches the disk.
+The gap is the Bloom filter: an absent key is answered from memory 41 times cheaper than the block read a present key needs.
 
-### Where a warm read actually goes
+Those are the numbers after the section below, which is about where the 7.54 µs a present key used to cost actually went.
 
-    ./scripts/flamegraph-server.sh docs/flamegraph-read-path.svg 5 read
+### Where a warm read actually went
 
-[The read path profile](docs/flamegraph-read-path.svg) runs `redis-benchmark -t get` against a store whose key space is several times its memtable, so the lookups reach the files rather than the table the keys were written to: 3.5 million blocks were read during the five seconds it samples. `SsTable::get` holds 34.4 % of the samples, and `read_checked`, which reads one block and verifies it, holds 33.5 % of them. Essentially all of a lookup is that one function.
+    ./scripts/flamegraph-server.sh docs/flamegraph-read-path-before.svg 5 read
+
+[The read path profile](docs/flamegraph-read-path-before.svg) runs `redis-benchmark -t get` against a store whose key space is several times its memtable, so the lookups reach the files rather than the table the keys were written to: 3.5 million blocks were read during the five seconds it samples. `SsTable::get` held 34.4 % of the samples, and `read_checked`, which reads one block and verifies it, held 33.5 % of them. Essentially all of a lookup was that one function.
 
 Naming the function is not the same as naming the cost, since the checksum is inlined into it. Taking the lookup apart with benchmarks that each add one step is what does that:
 
@@ -229,9 +231,37 @@ Naming the function is not the same as naming the cost, since the checksum is in
 | the same, allocating the buffer as the lookup does | 375.6 ns | 5.0 % |
 | the whole lookup | 7.54 µs | |
 
-Everything the design was careful about turns out to be the small part. The positional read that lets concurrent readers share one file handle is 324 ns. The sparse index and the filter that hold a lookup to a single block are 95 ns together. The allocation is 52 ns. What is left is about 7.1 µs, 94 % of a warm lookup, and the profile splits it: 247 samples in `scan_block` against 6554 in the read and its checksum. The checksum is nearly all of it.
+Everything the design was careful about turned out to be the small part. The positional read that lets concurrent readers share one file handle is 324 ns. The sparse index and the filter that hold a lookup to a single block are 95 ns together. The allocation is 52 ns. What was left was about 7.1 µs, 94 % of a warm lookup, and the profile splits it: 247 samples in `scan_block` against 6554 in the read and its checksum. The checksum was nearly all of it.
 
-That is not a surprise once stated. The CRC-32 is hand-written and table driven, one byte at a time, and 7.1 µs over 4 KiB is about 7.5 cycles per byte, which is what that shape costs. `CRC-32C` with the ARM64 `crc32c` instruction consumes 8 bytes per instruction, and slice-by-8 tables get most of the way there with no instruction set dependency. Both change the bytes on disk, so either is an SSTable format version rather than a drop-in, which is why this is written down with its number instead of already done.
+Which is not a surprise once stated. The CRC-32 was table driven one byte at a time, and 7.1 µs over 4 KiB is about 7.5 cycles per byte. That is not the table lookup being slow, it is that each step needs the checksum the step before it produced, so the eight-cycle dependency chain runs 4096 times and nothing else can start.
+
+### Breaking the chain
+
+Slice-by-eight keeps one table per byte position in a word. A step reads eight bytes and does eight lookups that do not depend on each other, so they issue together and only the final xor is serial.
+
+The polynomial does not change, so the bytes on disk do not either: a file written by one version reads back under the other. That is worth stating because the alternative does not have the property. `CRC-32C` with the ARM64 `crc32c` instruction is faster still, and it is a different polynomial, so it would be an SSTable format version bump; it also needs `unsafe` for the intrinsic, which is a lint this workspace denies everywhere. Slice-by-eight costs neither, which is why it went first.
+
+`crc32_matches_the_reference_implementation` keeps the byte-at-a-time version as a test and compares the two over every length from 0 to 1024 bytes, so the stride and the tail after it are both covered. Compatibility is checked rather than asserted.
+
+| | before | after | |
+|--|--------|-------|-|
+| `SsTable::get`, key present | 7.54 µs | 2.13 µs | 3.5x |
+| `SsTable::get`, key absent | 94.7 ns | 51.8 ns | 1.8x |
+| one 4 KiB positional read | 323.8 ns | 325.9 ns | unchanged |
+| the same, allocating | 375.6 ns | 376.0 ns | unchanged |
+
+The two reads are the control: nothing but the checksum was touched, and they say so. In [the profile afterwards](docs/flamegraph-read-path-after.svg) `read_checked` falls from 33.5 % of samples to 3.7 %, while `scan_block` holds at 247 samples against 264, which is the same control seen the other way.
+
+End to end, on reads that reach the files:
+
+    ./scripts/bench-server.sh
+
+| | GET/s | blocks read |
+|--|-------|-------------|
+| before | 1012145 | 273305 |
+| after | 1351351 | 271967 |
+
+A third faster for the same blocks read. The micro-benchmark says 3.5x and the server says 1.33x, and the profile reconciles them: `Engine::get` was 38.4 % of samples and is now 10.2 %, and removing 28 points of a profile is worth about 1.4x. The rest of a pipelined request is network, RESP and the hop onto the blocking pool, and none of that moved.
 
 ### What a crash during a flush must not cost
 
@@ -278,7 +308,7 @@ What a probe costs is the other half of that trade:
 
 Hashing one key is 1.70 ns of that, paid once whatever the probe count. Going from 6 probes to 11 costs 7.2 ns on a present key, about 1.4 ns per extra probe, which is a memory read and not a hash: that is the double hashing doing what it was chosen for, and it means the bits-per-key choice above is a memory decision rather than a CPU one.
 
-One result is not explained yet. An absent key should be the *cheaper* case, since the probe loop stops at the first clear bit instead of running to the end, and it measures slower at 8 and 10 bits per key. The likely cause is that the loop exits at a predictable place on a present key and an unpredictable one on an absent key, but that is a hypothesis, and a hypothesis is not a finding. What the number does settle is the one the read path cares about: rejecting a file costs 26 ns against the 7.5 µs of the block read it saves.
+One result is not explained yet. An absent key should be the *cheaper* case, since the probe loop stops at the first clear bit instead of running to the end, and it measures slower at 8 and 10 bits per key. The likely cause is that the loop exits at a predictable place on a present key and an unpredictable one on an absent key, but that is a hypothesis, and a hypothesis is not a finding. What the number does settle is the one the read path cares about: rejecting a file costs 26 ns against the 2.13 µs of the block read it saves.
 
 The same run then measures the store itself. It writes 6000 keys in a scattered order so the eleven files that come out overlap in key range instead of partitioning it, which is both what a real workload produces and the case where the filters matter, since every file then has to be consulted:
 

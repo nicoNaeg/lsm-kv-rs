@@ -13,6 +13,8 @@ CLIENTS=${2:-50}
 KV_PORT=6390
 # Distinct keys the memtable comparison spreads its writes over.
 KEYSPACE=100000
+# Small enough that the key space above does not fit, so reads reach the files.
+DISK_MEMTABLE=1048576
 REDIS_PORT=6391
 BIN=$(dirname "$0")/../target/release/lsmkv-server
 WORK=$(mktemp -d)
@@ -53,7 +55,7 @@ measure() {
 start_kv() {
   rm -rf "$WORK/kv"
   "$BIN" --dir "$WORK/kv" --port $KV_PORT --sync "$1" --memtable "${2:-btree}" \
-    > /dev/null 2>&1 &
+    ${3:+--memtable-bytes $3} > /dev/null 2>&1 &
   SERVER_PID=$!
   sleep 1
 }
@@ -136,3 +138,29 @@ for kind in btree skiplist; do
   measure "lsm-kv-rs, $kind" $KV_PORT 16 $KEYSPACE
   stop
 done
+
+
+# Everything above reads from memory: the key space fits in the memtable, so a
+# GET never opens a file. This one does not fit, so the reads go through the
+# Bloom filter, the sparse index and a block read, which is the path the
+# checksum sits on.
+echo
+echo "Reads from disk, $KEYSPACE keys over a ${DISK_MEMTABLE}B memtable:"
+echo
+
+start_kv 10 btree $DISK_MEMTABLE
+redis-benchmark -p $KV_PORT -t set -n $((KEYSPACE * 2)) -c "$CLIENTS" -P 16 \
+  -r $KEYSPACE -q > /dev/null 2>&1
+sleep 5
+files=$(redis-cli -p $KV_PORT info 2> /dev/null | tr -d '\r' \
+  | grep '^files:' | cut -d: -f2)
+before=$(redis-cli -p $KV_PORT info 2> /dev/null | tr -d '\r' \
+  | grep '^block_reads:' | cut -d: -f2)
+rate=$(redis-benchmark -p $KV_PORT -t get -n $((KEYSPACE * 5)) -c "$CLIENTS" -P 16 \
+  -r $KEYSPACE -q 2> /dev/null | tr '\r' '\n' | grep 'requests per second' \
+  | sed -E 's/.*: ([0-9]+)\.[0-9]+ requests.*/\1/')
+after=$(redis-cli -p $KV_PORT info 2> /dev/null | tr -d '\r' \
+  | grep '^block_reads:' | cut -d: -f2)
+stop
+
+echo "GET/s: $rate over $files files, $((after - before)) blocks read"
