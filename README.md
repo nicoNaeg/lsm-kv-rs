@@ -274,6 +274,16 @@ Three orderings carry the guarantee, each against a failure that would otherwise
 - the directory entry is flushed before any log is unlinked, otherwise a crash could leave neither the log nor the file;
 - the logs go last. A crash before that leaves logs whose records already sit in a file, and replaying them is harmless: the memtable they rebuild holds the same values and shadows the file anyway.
 
+Those three are an argument until something kills the process.
+
+    cargo test --test crash
+
+A child writes `k0`, `k1`, `k2` in order under group commit, never starting one before the last returned, and the parent kills it with `SIGKILL` at a random moment, reopens the store and checks what survived. Nothing stands between the engine and the filesystem, and `SIGKILL` is not something a destructor or a handler gets to soften, so what survives is what reached the device.
+
+The oracle needs no channel between the two processes, which is what makes it worth trusting: a channel would be subject to the same crash. Since every write was acknowledged before the next began, the surviving keys must be a **prefix** of the sequence. A hole is an acknowledged write that was lost, a wrong value is corruption, and a key past the end is a write that was never acknowledged surfacing anyway. Thirty iterations, every third of them killing the store a second time while it is still replaying what the last crash left, and each run continues from the highest key it finds so the tree deepens as the test goes.
+
+What decides whether a test like that is worth anything is not the oracle, it is the chance of the kill landing where a bug lives, and those windows are a couple of device flushes wide. This one was checked against an engine deliberately changed to unlink the logs before the manifest names the table, which is the defect the second ordering above exists to prevent. At a 2 KiB memtable it passed: a flush every 300 ms with an 8 ms window is 2 % of the run, so thirty kills expect 0.7 hits and finding none proves nothing. At 256 bytes the store is almost always mid-flush and the same defect fails at iteration 5, reporting `k71 exists past the end of the prefix at 61`. The memtable size in that test is its power, not its scenery.
+
 ### Reading across levels
 
 A lookup walks the active memtable, then the frozen ones, then the files from newest to oldest, and stops at the first level that answers. This is where the three-way answer earns its keep: a value and a tombstone both stop the search, and only "not here" continues to older levels. A key deleted after its value reached a file is exactly that, a tombstone in a newer level shadowing an older file.
