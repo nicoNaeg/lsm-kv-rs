@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! lsmkv-server [--dir PATH] [--port N] [--sync always|group|<milliseconds>]
-//!              [--memtable-bytes N]
+//!              [--memtable-bytes N] [--memtable btree|skiplist]
 //! ```
 
 use std::net::{Ipv4Addr, SocketAddr};
@@ -10,7 +10,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use lsmkv::{Config, Engine, SyncPolicy};
+use lsmkv::{Config, Engine, MemtableKind, SyncPolicy};
 use lsmkv_server::server;
 
 const USAGE: &str = "\
@@ -21,6 +21,7 @@ lsmkv-server [options]
   --sync POLICY           always, group, or a number of milliseconds for the
                           interval policy (default: group)
   --memtable-bytes N      bytes held in memory before a flush (default: 4194304)
+  --memtable KIND         btree or skiplist (default: btree)
   --help                  print this
 ";
 
@@ -97,6 +98,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Options>, Str
                     .map_err(|_| "--memtable-bytes takes a number of bytes".to_owned())?;
             }
             "--sync" => options.config.sync = sync_policy(&value(&mut args, &flag)?)?,
+            "--memtable" => options.config.memtable = memtable_kind(&value(&mut args, &flag)?)?,
             other => return Err(format!("unknown option {other}")),
         }
     }
@@ -105,6 +107,14 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Options>, Str
 
 fn value(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
     args.next().ok_or_else(|| format!("{flag} takes a value"))
+}
+
+fn memtable_kind(text: &str) -> Result<MemtableKind, String> {
+    match text {
+        "btree" => Ok(MemtableKind::BTree),
+        "skiplist" => Ok(MemtableKind::Skiplist),
+        _ => Err("--memtable takes btree or skiplist".to_owned()),
+    }
 }
 
 fn sync_policy(text: &str) -> Result<SyncPolicy, String> {

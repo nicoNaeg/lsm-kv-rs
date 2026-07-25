@@ -16,6 +16,10 @@ workspace = true
 [dev-dependencies]
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 
+# Model checking for the skiplist, built only under RUSTFLAGS="--cfg loom".
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7.2"
+
 [[bench]]
 name = "memtable"
 harness = false

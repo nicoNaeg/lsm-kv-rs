@@ -1,4 +1,4 @@
-.PHONY: build server bench bench-server flamegraph test lint fmt
+.PHONY: build server bench bench-server flamegraph test loom lint fmt
 
 build:
 	cargo build --release
@@ -17,6 +17,9 @@ flamegraph: build
 
 test:
 	cargo test --all-features
+
+loom:
+	LOOM_MAX_BRANCHES=50000 RUSTFLAGS="--cfg loom" cargo test -p lsmkv --lib loom
 
 lint:
 	cargo fmt --all --check

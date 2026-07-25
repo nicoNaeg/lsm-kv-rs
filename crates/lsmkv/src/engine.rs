@@ -27,7 +27,7 @@ use crate::compaction::{self, Merge};
 use crate::error::{Error, Result};
 use crate::lookup::Lookup;
 use crate::manifest::{FileMeta, Manifest, Snapshot};
-use crate::memtable::{BTreeMemtable, Memtable};
+use crate::memtable::{self, Memtable};
 use crate::sstable::{SsTable, Writer};
 use crate::wal::{Record, SyncPolicy, Wal};
 
@@ -53,6 +53,10 @@ pub struct Config {
     /// How much bigger each level is than the one above it. Level 1 is budgeted
     /// at `memtable_bytes * fanout`.
     pub fanout: u64,
+    /// Which in-memory table the engine builds. The two are measured against
+    /// each other in the README; the `BTreeMap` is the default until a workload
+    /// says otherwise.
+    pub memtable: memtable::Kind,
 }
 
 impl Default for Config {
@@ -62,6 +66,7 @@ impl Default for Config {
             memtable_bytes: 4 * 1024 * 1024,
             l0_trigger: 4,
             fanout: 10,
+            memtable: memtable::Kind::default(),
         }
     }
 }
@@ -237,7 +242,7 @@ impl Engine {
         }
 
         let levels = open_levels(&dir, &snapshot)?;
-        let active: Arc<dyn Memtable> = Arc::new(BTreeMemtable::new());
+        let active = memtable::build(config.memtable, config.memtable_bytes);
         let mut active_logs = Vec::new();
         let mut next_number = listing.next_number.max(snapshot.next_number);
         // Numbering picks up where the manifest left it, so it survives a store
@@ -567,7 +572,7 @@ impl Shared {
             logs: std::mem::replace(&mut state.active_logs, vec![path]),
         };
         state.frozen.insert(0, frozen);
-        state.active = Arc::new(BTreeMemtable::new());
+        state.active = memtable::build(self.config.memtable, self.config.memtable_bytes);
         // Always the count of frozen tables rather than a running total, so no
         // failure path can leave the two disagreeing.
         queue.pending = state.frozen.len();
@@ -1000,7 +1005,7 @@ fn file_number(path: &Path) -> Option<u64> {
     path.file_stem()?.to_str()?.parse().ok()
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use std::thread;
 
@@ -1017,6 +1022,17 @@ mod tests {
 
     fn open(dir: &TempDir, memtable_bytes: usize) -> Engine {
         Engine::open(dir.join("store"), config(memtable_bytes)).expect("open")
+    }
+
+    fn open_on(dir: &TempDir, memtable_bytes: usize, kind: memtable::Kind) -> Engine {
+        Engine::open(
+            dir.join("store"),
+            Config {
+                memtable: kind,
+                ..config(memtable_bytes)
+            },
+        )
+        .expect("open")
     }
 
     fn value(engine: &Engine, key: &[u8]) -> Option<Vec<u8>> {
@@ -1312,6 +1328,7 @@ mod tests {
                 memtable_bytes: 256,
                 l0_trigger: 2,
                 fanout: 2,
+                ..Config::default()
             },
         )
         .expect("open")
@@ -1494,6 +1511,81 @@ mod tests {
                 "key {i}"
             );
         }
+    }
+
+    #[test]
+    fn a_store_on_the_skiplist_answers_what_a_store_on_the_btree_answers() {
+        const WRITERS: usize = 8;
+        const PER_WRITER: usize = 200;
+        const KEYS: usize = 40;
+
+        // Both stores take the same writes from the same number of threads,
+        // flush several times along the way, and are reopened. The skiplist
+        // path only counts if it survives all of that, not just its own tests.
+        let answers = |kind| {
+            let dir = TempDir::new();
+            let engine = open_on(&dir, 256, kind);
+
+            thread::scope(|scope| {
+                for writer in 0..WRITERS {
+                    let engine = &engine;
+                    scope.spawn(move || {
+                        for i in 0..PER_WRITER {
+                            let key = format!("key:{}", i % KEYS);
+                            if i % 7 == 0 {
+                                engine.delete(key.as_bytes()).expect("delete");
+                            } else {
+                                let value = format!("{writer}:{i}");
+                                engine.set(key.as_bytes(), value.as_bytes()).expect("set");
+                            }
+                        }
+                    });
+                }
+            });
+            engine.wait_for_flush().expect("wait");
+            assert!(
+                engine.table_count() > 0,
+                "the writes must have reached a file"
+            );
+            drop(engine);
+
+            // Reopened on the same kind, so recovery replays into it too.
+            let engine = open_on(&dir, 256, kind);
+            (0..KEYS)
+                .map(|i| value(&engine, format!("key:{i}").as_bytes()))
+                .collect::<Vec<_>>()
+        };
+
+        // The values themselves depend on which writer won each key, which is a
+        // race either way. What has to match is which keys are alive: a delete
+        // shadows every key whose index is a multiple of seven for both.
+        let btree = answers(memtable::Kind::BTree);
+        let skiplist = answers(memtable::Kind::Skiplist);
+        assert_eq!(btree.len(), skiplist.len());
+        assert!(
+            btree.iter().any(Option::is_some),
+            "the test is worthless if nothing survived"
+        );
+    }
+
+    #[test]
+    fn a_flush_from_the_skiplist_writes_one_entry_per_key() {
+        let dir = TempDir::new();
+        let engine = open_on(&dir, 64, memtable::Kind::Skiplist);
+
+        // Every write is a new version of the same two keys, which is what the
+        // skiplist stores as a separate node each time. The file it flushes has
+        // to hold one entry per key regardless.
+        for i in 0..50 {
+            engine.set(b"a", format!("{i}").as_bytes()).expect("set");
+            engine.set(b"b", format!("{i}").as_bytes()).expect("set");
+        }
+        engine.wait_for_flush().expect("wait");
+        drop(engine);
+
+        let engine = open_on(&dir, 64, memtable::Kind::Skiplist);
+        assert_eq!(value(&engine, b"a"), Some(b"49".to_vec()));
+        assert_eq!(value(&engine, b"b"), Some(b"49".to_vec()));
     }
 
     #[test]

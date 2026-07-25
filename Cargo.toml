@@ -12,6 +12,9 @@ authors = ["Nicolas Naegelen"]
 
 [workspace.lints.rust]
 missing_docs = "warn"
+# The skiplist swaps its atomics for loom's under this, set by RUSTFLAGS rather
+# than by a feature so a normal build never carries the dependency.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 # A module that needs unsafe opts out explicitly, with a justification and a
 # Miri or loom test.
 unsafe_code = "deny"

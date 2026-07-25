@@ -1,5 +1,8 @@
-//! A `BTreeMap` behind one `RwLock`: readers run concurrently, writers take
-//! turns, and a writer excludes every reader for the length of its insert.
+//! The baseline: a `BTreeMap` behind one `RwLock`.
+//!
+//! Readers run concurrently, writers take turns, and a writer excludes every
+//! reader for the length of its insert. That last property is what the
+//! skiplist next door was written against.
 
 use std::collections::BTreeMap;
 use std::sync::RwLock;
@@ -117,43 +120,9 @@ impl Memtable for BTreeMemtable {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
-    use std::thread;
-
     use super::*;
-
-    #[test]
-    fn a_value_is_read_back() {
-        let table = BTreeMemtable::new();
-        assert!(table.insert(b"key", 1, Some(b"value".to_vec())));
-
-        assert_eq!(table.get(b"key"), Lookup::Found(b"value".to_vec()));
-        assert_eq!(table.get(b"other"), Lookup::Missing);
-    }
-
-    #[test]
-    fn a_tombstone_shadows_the_value_it_replaces() {
-        let table = BTreeMemtable::new();
-        table.insert(b"key", 1, Some(b"value".to_vec()));
-        table.insert(b"key", 2, None);
-
-        assert_eq!(table.get(b"key"), Lookup::Deleted);
-        assert_eq!(table.len(), 1, "a tombstone still occupies the key");
-    }
-
-    #[test]
-    fn a_later_sequence_number_wins_whatever_the_arrival_order() {
-        let table = BTreeMemtable::new();
-
-        assert!(table.insert(b"key", 2, Some(b"newer".to_vec())));
-        assert!(
-            !table.insert(b"key", 1, Some(b"older".to_vec())),
-            "an older mutation must not overwrite a newer one"
-        );
-
-        assert_eq!(table.get(b"key"), Lookup::Found(b"newer".to_vec()));
-    }
 
     #[test]
     fn keys_are_held_in_sorted_order() {
@@ -180,33 +149,5 @@ mod tests {
 
         table.insert(b"key", 3, None);
         assert_eq!(table.approx_bytes(), 3, "a tombstone keeps only its key");
-    }
-
-    #[test]
-    fn concurrent_writers_converge_on_the_highest_sequence_number() {
-        const WRITERS: u64 = 8;
-        const PER_WRITER: u64 = 500;
-
-        let table = BTreeMemtable::new();
-        thread::scope(|scope| {
-            for writer in 0..WRITERS {
-                let table = &table;
-                scope.spawn(move || {
-                    for i in 0..PER_WRITER {
-                        // Sequence numbers are handed out by the log, so they
-                        // are unique across writers.
-                        let seq = i * WRITERS + writer + 1;
-                        table.insert(b"contended", seq, Some(seq.to_be_bytes().to_vec()));
-                    }
-                });
-            }
-        });
-
-        let highest = PER_WRITER * WRITERS;
-        assert_eq!(
-            table.get(b"contended"),
-            Lookup::Found(highest.to_be_bytes().to_vec())
-        );
-        assert_eq!(table.len(), 1);
     }
 }

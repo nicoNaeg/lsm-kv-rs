@@ -110,7 +110,9 @@ assert_eq!(db.get(b"user:1")?, Some(b"nicolas".to_vec()));
 db.delete(b"user:1")?;
 ```
 
-A write is appended to the log, and only then applied to the sorted in-memory table, so nothing is visible before the sync policy considers it durable. The table is a `BTreeMap` behind one `RwLock`: readers run concurrently, writers take turns. Sorted, because a full table is flushed to disk in one sequential pass and that file has to come out sorted.
+A write is appended to the log, and only then applied to the sorted in-memory table, so nothing is visible before the sync policy considers it durable. Sorted, because a full table is flushed to disk in one sequential pass and that file has to come out sorted.
+
+Two implementations sit behind one `Memtable` trait, selected by `Config::memtable` and by `--memtable` on the server. A `BTreeMap` behind one `RwLock` is the default; a hand-written lock-free skiplist is the alternative, and the comparison between them is below.
 
 One lock over the whole table rather than shards, because every write already passes through the log's single append lock, which the stage 1 numbers identify as the real serialization point. Sharding the table would optimize the wrong lock, and hash sharding would also cost the global sorted order the flush depends on.
 
@@ -118,29 +120,69 @@ Each entry carries the sequence number the log gave its record, and an entry is 
 
 A delete writes a tombstone instead of erasing the entry, because the key may still live in an older file on disk. The tombstone is what shadows it until compaction drops both.
 
-### What one lock costs
+### The skiplist, and what one lock costs
+
+The skiplist is lock-free and written in safe Rust: `unsafe_code = "deny"` holds across the whole workspace. Nodes live in an arena allocated once, and a link is an index into it rather than an address, which is what an arena allocator reduces a pointer to anyway. Two properties of an LSM memtable are what allow that:
+
+- it never frees a single node, it is dropped whole once its flush is done, so there is nothing to reclaim under readers and no epochs or hazard pointers are needed;
+- a published node is never modified, because an overwrite inserts a new version rather than editing the old one, so a reader that reaches a node can read it without synchronizing against anything.
+
+Nodes are ordered by key ascending then by sequence number descending, so the versions of one key sit together with the newest first. A lookup takes the first one it finds, a flush takes the first of each group.
 
     cargo bench --bench memtable
 
-A table already holding 100k entries, keys of 16 bytes and values of 100. Inserts are timed in batches of 10 000 against a table rebuilt outside the timed section, so the number is the structure and not the memory pressure of an unbounded run:
+Keys of 16 bytes, values of 100, inserts timed in batches of 10 000 against a table rebuilt outside the timed section:
 
-| operation | per operation |
-|-----------|---------------|
-| get, hit | 67.7 ns |
-| get, miss | 71.3 ns |
-| insert into an empty table | 138 ns |
-| insert into a table of 100k | 183 ns |
+| per operation | BTreeMap | skiplist | |
+|---------------|----------|----------|-|
+| get, hit | 68.8 ns | 139.9 ns | 2.0x slower |
+| get, miss | 71.9 ns | 105.8 ns | 1.5x slower |
+| insert into an empty table | 141.8 ns | 102.9 ns | 1.4x faster |
+| insert into a table of 100k | 187.1 ns | 121.7 ns | 1.5x faster |
 
-Those are the uncontended numbers. The one that matters is what happens when readers are running against the same table:
+Then the measurement the skiplist was written for, an insert while readers hammer the same table:
 
-| readers hammering `get` | per insert | against no readers |
-|-------------------------|------------|--------------------|
-| 0 | 77.8 ns | |
-| 1 | 259 ns | 3.3x |
-| 4 | 910 ns | 12x |
-| 8 | 3.70 µs | 48x |
+| readers | BTreeMap | skiplist | |
+|---------|----------|----------|-|
+| 0 | 195.3 ns | 124.1 ns | 1.6x |
+| 1 | 229.0 ns | 149.4 ns | 1.5x |
+| 4 | 2.19 µs | 303.7 ns | 7.2x |
+| 8 | 11.68 µs | 341.8 ns | **34x** |
 
-One concurrent reader more than triples the cost of an insert, and eight multiply it by 48. This is not contention in the usual sense, it is the writer being starved: a reader-preferring `RwLock` lets a steady stream of readers hold the shared lock continuously, and the writer waits for a gap between them. The absolute numbers stay small next to a 3.8 ms device flush, so nothing here is the bottleneck today, but this is the specific shape a lock-free structure removes, and it is the baseline stage 8 measures its skiplist against.
+Eight readers multiply a `BTreeMap` insert by 60 and a skiplist insert by 2.8. What the `BTreeMap` suffers is not contention in the usual sense, it is the writer being starved: a reader-preferring `RwLock` lets a steady stream of readers hold the shared lock continuously, and the writer waits for a gap between them that never comes. That is the shape a lock-free structure removes, and it removes it.
+
+The reads going the other way is the cost of the trade. A `BTreeMap` node holds its keys contiguously and a lookup walks a handful of cache lines; a skiplist lookup jumps around an arena of several megabytes. Half of the 139.9 ns is that, the rest is copying the value out.
+
+### Why the 34x does not reach the server
+
+A structure that wins its micro-benchmark by 34x and changes nothing end to end is the more useful result of the two, so here is that measurement, from the same script that compares the server against Redis:
+
+    ./scripts/bench-server.sh
+
+| memtable | SET/s | GET/s | pipelined SET/s | pipelined GET/s |
+|----------|-------|-------|-----------------|-----------------|
+| BTreeMap | 96618 | 98522 | 696864 | 1612903 |
+| skiplist | 99009 | 100502 | 673400 | 869565 |
+
+Unpipelined the two are level, both near 100k, because neither is what limits that path: a request there costs a syscall, a wakeup and a hop onto the blocking pool, and the memtable operation is under a fraction of a percent of it. The 34x is real and it is spent on something that was never the bottleneck.
+
+Pipelined, the skiplist loses on reads, and the cause is not the 2x lookup. It is the arena. It is sized from the memtable budget at an assumed 96 bytes per entry, so a 4 MiB budget buys about 44 700 nodes. `redis-benchmark` writes entries of about 20 bytes, so those nodes run out at roughly a fifth of the byte budget, and the table is frozen there. Over 200 000 writes across 100 000 keys the skiplist wrote 4 files and 5.3 MB while the `BTreeMap` never flushed at all, so its reads go to disk where the other's are still in memory.
+
+That is the cost of the fixed arena, and it is the honest price of writing the structure without pointers: an arena that cannot grow has to be sized for an entry size chosen in advance, and being wrong costs either memory or early flushes. Sizing it for 20 byte entries instead would take a 4 MiB table to 11 MB of arena.
+
+So the `BTreeMap` stays the default, on the numbers rather than on preference. The skiplist is the right structure for a workload with many concurrent readers over a table that is written to constantly, and this server, at 100k requests per second over one socket, is not that workload yet.
+
+### Why both ship
+
+An implementation that is not the default earns its place or it goes. This one earns it three ways, and none of them is that it was work to write.
+
+It is the second implementation the trait was extracted from. A trait written against one implementation is a guess about what varies; this one was cut where two structures actually differ, and the difference is not where it looked from the `BTreeMap` alone. `approx_bytes` is the example: it reads as key and value bytes until an implementation has a fixed arena, at which point reporting a size is the only lever it has on when the engine freezes it.
+
+It is what makes the numbers above reproducible. Every claim in this README comes with the command that produces it, and `cargo bench --bench memtable` produces both columns or neither.
+
+And it is selectable, not shelved: `--memtable skiplist` on the server, `Config::memtable` in the library. Both run the same test suite, and the skiplist additionally carries the loom models of its linking protocol. If the workload changes, the alternative is a flag rather than a rewrite.
+
+What it is not is a recommendation. On this machine and this workload the `BTreeMap` wins, and that is what the default says.
 
 ## Sorted files on disk
 
@@ -341,15 +383,20 @@ Each stage lands with its tests before the next one starts.
 5. **Compaction** (built): manifest, leveled background merge, tombstone purge.
 6. **Server** (built): RESP2 subset on tokio, so redis-cli and redis-benchmark drive the engine unchanged.
 7. **Benchmarks and profiling** (built): criterion micro-benchmarks, redis-benchmark end to end, flamegraph of the write path, and the log batching it pointed at.
-8. **Skiplist memtable**: hand-written concurrent skiplist measured against the BTreeMap baseline. The memtable interface is extracted then, from two implementations rather than from one.
+8. **Skiplist memtable** (built): hand-written lock-free skiplist measured against the BTreeMap baseline, with the memtable interface extracted from the two rather than from one.
 
-Current stage: 8.
+All eight stages are built.
 
 ## Benchmarking
 
 Three levels, all committed and rerunnable:
 
 - criterion micro-benchmarks isolate one structure at a time: `cargo bench`, reported above.
+- the skiplist carries a loom model of its linking protocol, which runs every interleaving of its writers and every ordering the memory model allows:
+
+      LOOM_MAX_BRANCHES=50000 RUSTFLAGS="--cfg loom" cargo test -p lsmkv --lib loom
+
+  The models were checked to fail when the defect they exist for is put back, since a model that cannot fail is not a test.
 - each stage ships the measurement that shaped its design as an example anyone can rerun, `cargo run --release --example wal_bench` for the log, `--example compaction` for the levels, `--example bloom_fp` for the filters.
 - `redis-benchmark` measures the whole path over TCP with the same tool and flags people point at Redis, so the result can be compared to Redis running on the same machine.
 
@@ -360,6 +407,7 @@ Measurements are taken on an Apple M4 Pro, 12 cores, 24 GB unified memory.
 ## Repository layout
 
     crates/lsmkv/         storage engine, synchronous, owns one data directory
+    crates/lsmkv/src/memtable/  the two in-memory tables behind one trait
     crates/lsmkv/benches/ criterion micro-benchmarks, one file per structure
     crates/lsmkv-server/  RESP2 server on tokio, and the protocol itself
     docs/                 flamegraphs the README cites
@@ -374,6 +422,7 @@ Requires a stable Rust toolchain; `rust-toolchain.toml` pins the channel and the
     make server      start the server on port 6379 over ./data
     make test        run the test suite
     make bench       run the criterion micro-benchmarks
+    make loom        model check the skiplist under loom
     make lint        rustfmt check, then clippy with warnings denied
     make fmt         format, then apply the clippy fixes
 

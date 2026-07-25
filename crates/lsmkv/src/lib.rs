@@ -28,6 +28,6 @@ pub use engine::{Config, Engine};
 pub use error::{Error, Result};
 pub use lookup::Lookup;
 pub use manifest::Manifest;
-pub use memtable::{BTreeMemtable, Memtable};
+pub use memtable::{Kind as MemtableKind, Memtable};
 pub use sstable::SsTable;
 pub use wal::{Record, SyncPolicy, Wal};
