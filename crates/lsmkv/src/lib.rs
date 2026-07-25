@@ -19,7 +19,7 @@ pub mod sstable;
 mod testutil;
 pub mod wal;
 
-pub use engine::Engine;
+pub use engine::{Config, Engine};
 pub use error::{Error, Result};
 pub use lookup::Lookup;
 pub use memtable::Memtable;

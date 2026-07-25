@@ -1,71 +1,212 @@
-//! The storage engine: a write-ahead log and the sorted table it feeds.
+//! The storage engine: a log, the sorted table it feeds, and the files that
+//! table is flushed to.
+//!
+//! A write goes to the log, then to the active memtable. Once that table passes
+//! its size limit it is frozen, a fresh log is started, and a background thread
+//! writes the frozen table out as a sorted file and deletes the logs it made
+//! redundant. A read walks the active table, then the frozen ones, then the
+//! files from newest to oldest, and stops at the first level that answers.
 
-use std::fs;
+use std::fs::{self, File};
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, PoisonError, RwLock};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use crate::error::{Error, Result};
 use crate::lookup::Lookup;
 use crate::memtable::Memtable;
+use crate::sstable::{SsTable, Writer};
 use crate::wal::{Record, SyncPolicy, Wal};
 
-/// Name of the log inside the data directory.
-const WAL_FILE: &str = "wal";
+const POISONED: &str = "a thread panicked while holding the engine";
+const LOG_EXT: &str = "wal";
+const TABLE_EXT: &str = "sst";
+/// Extension a table carries until it is complete and on the device.
+const PARTIAL_EXT: &str = "tmp";
+/// Delay before a failed flush is attempted again.
+const RETRY_DELAY: Duration = Duration::from_secs(1);
+
+/// How a store is opened.
+#[derive(Debug, Clone, Copy)]
+pub struct Config {
+    /// When the log is pushed to the device.
+    pub sync: SyncPolicy,
+    /// Key and value bytes the active memtable holds before it is frozen and
+    /// written to disk.
+    pub memtable_bytes: usize,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            sync: SyncPolicy::default(),
+            memtable_bytes: 4 * 1024 * 1024,
+        }
+    }
+}
 
 /// A key-value store over one data directory.
 ///
-/// Every method takes `&self`: the engine is shared across threads behind an
-/// [`Arc`](std::sync::Arc), and does its own locking.
+/// Every method takes `&self`: the store is shared across threads behind an
+/// [`Arc`], and does its own locking.
 #[derive(Debug)]
 pub struct Engine {
+    shared: Arc<Shared>,
+    flusher: Option<JoinHandle<()>>,
+}
+
+#[derive(Debug)]
+struct Shared {
     dir: PathBuf,
-    wal: Wal,
-    memtable: Memtable,
+    config: Config,
+    /// The current log. Writers hold it for reading, which is what stops a
+    /// rotation from splitting a write between two logs.
+    wal: RwLock<Wal>,
+    /// Signals work to the flush thread, and progress back to whoever waits.
+    /// Locked before `state`, never after.
+    queue: Mutex<FlushQueue>,
+    progress: Condvar,
+    state: RwLock<State>,
+    /// Next number for a log or a table. The two share one numbering space.
+    next_number: AtomicU64,
+    /// Failure of a background flush, reported to the next caller that can.
+    flush_error: Mutex<Option<Error>>,
+}
+
+#[derive(Debug, Default)]
+struct FlushQueue {
+    /// Frozen memtables not yet on disk.
+    pending: usize,
+    shutdown: bool,
+}
+
+#[derive(Debug)]
+struct State {
+    active: Arc<Memtable>,
+    /// Logs holding the active table's records.
+    active_logs: Vec<PathBuf>,
+    /// Tables frozen but not yet on disk, newest first.
+    frozen: Vec<Frozen>,
+    /// Files on disk, newest first.
+    tables: Vec<Arc<SsTable>>,
+}
+
+/// A memtable waiting to become a file, and the logs that still hold it.
+#[derive(Debug, Clone)]
+struct Frozen {
+    memtable: Arc<Memtable>,
+    logs: Vec<PathBuf>,
 }
 
 impl Engine {
     /// Opens the store held in `dir`, creating the directory if needed and
-    /// rebuilding memory from the log.
+    /// rebuilding memory from the logs left behind.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Corrupt`] if the log is not readable as one, and
-    /// [`Error::Io`] if the directory or the log cannot be opened.
-    pub fn open(dir: impl AsRef<Path>, sync: SyncPolicy) -> Result<Self> {
+    /// Returns [`Error::Corrupt`] if a log or a table is not readable as one,
+    /// and [`Error::Io`] if the directory or its files cannot be opened.
+    pub fn open(dir: impl AsRef<Path>, config: Config) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir).map_err(|err| Error::io(&dir, err))?;
+        let listing = Listing::scan(&dir)?;
 
-        let (wal, records) = Wal::recover(dir.join(WAL_FILE), sync)?;
-        let memtable = Memtable::new();
-        for (index, record) in records.into_iter().enumerate() {
-            // Replay order is append order, which is what the log's own
-            // sequence numbers count.
-            let seq = index as u64 + 1;
-            match record {
-                Record::Set { key, value } => memtable.insert(&key, seq, Some(value)),
-                Record::Delete { key } => memtable.insert(&key, seq, None),
-            };
+        // A table a crash caught mid-write is unusable, and the logs it was
+        // built from are still there, so it is dropped rather than opened.
+        for path in &listing.partial {
+            fs::remove_file(path).map_err(|err| Error::io(path, err))?;
         }
 
-        Ok(Self { dir, wal, memtable })
+        let mut tables = Vec::with_capacity(listing.tables.len());
+        for number in &listing.tables {
+            tables.push(Arc::new(SsTable::open(
+                dir.join(file_name(*number, TABLE_EXT)),
+            )?));
+        }
+        // Highest number is the most recent write, and a lookup wants that
+        // first.
+        tables.reverse();
+
+        let active = Memtable::new();
+        let mut active_logs = Vec::new();
+        let mut next_number = listing.next_number;
+        let mut last_seq = 0;
+
+        // Every log still present holds records no table carries yet, so they
+        // all rebuild the one active table.
+        let wal = if let Some((newest, older)) = listing.logs.split_last() {
+            for number in older {
+                let path = dir.join(file_name(*number, LOG_EXT));
+                for record in Wal::replay(&path)? {
+                    last_seq = last_seq.max(apply(&active, record?));
+                }
+                active_logs.push(path);
+            }
+            let path = dir.join(file_name(*newest, LOG_EXT));
+            let (wal, records) = Wal::recover(&path, config.sync, last_seq)?;
+            for record in records {
+                apply(&active, record);
+            }
+            active_logs.push(path);
+            wal
+        } else {
+            let path = dir.join(file_name(next_number, LOG_EXT));
+            next_number += 1;
+            let wal = Wal::create(&path, config.sync, 0)?;
+            active_logs.push(path);
+            wal
+        };
+
+        let shared = Arc::new(Shared {
+            dir,
+            config,
+            wal: RwLock::new(wal),
+            queue: Mutex::new(FlushQueue::default()),
+            progress: Condvar::new(),
+            state: RwLock::new(State {
+                active: Arc::new(active),
+                active_logs,
+                frozen: Vec::new(),
+                tables,
+            }),
+            next_number: AtomicU64::new(next_number),
+            flush_error: Mutex::new(None),
+        });
+        let flusher = Some(spawn_flusher(&shared));
+
+        Ok(Self { shared, flusher })
     }
 
     /// Reads `key`.
     ///
     /// # Errors
     ///
-    /// None today. The signature already carries the failures the read path
-    /// gains once it reaches the files on disk.
+    /// Returns [`Error::Corrupt`] if a table block does not match its checksum,
+    /// and [`Error::Io`] if it cannot be read.
     ///
     /// # Panics
     ///
-    /// Panics if a previous writer panicked while holding the memtable.
+    /// Panics if a previous writer panicked while holding the store.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        match self.memtable.get(key) {
-            Lookup::Found(value) => Ok(Some(value)),
-            // Once SSTables exist, only `Missing` continues the search: a
-            // tombstone is an answer, and it stops the lookup here.
-            Lookup::Deleted | Lookup::Missing => Ok(None),
+        let state = self.shared.state.read().expect(POISONED);
+
+        if let ControlFlow::Break(answer) = answer(state.active.get(key)) {
+            return Ok(answer);
         }
+        for frozen in &state.frozen {
+            if let ControlFlow::Break(answer) = answer(frozen.memtable.get(key)) {
+                return Ok(answer);
+            }
+        }
+        for table in &state.tables {
+            if let ControlFlow::Break(answer) = answer(table.get(key)?) {
+                return Ok(answer);
+            }
+        }
+        Ok(None)
     }
 
     /// Binds `key` to `value`.
@@ -76,16 +217,14 @@ impl Engine {
     /// # Errors
     ///
     /// Returns [`Error::TooLarge`] if the key or the value exceeds 4 GiB, and
-    /// [`Error::Io`] if the log cannot be written or flushed.
+    /// [`Error::Io`] if the log cannot be written or flushed. A background flush
+    /// that failed is reported here, once.
     ///
     /// # Panics
     ///
-    /// Panics if a previous writer panicked while appending or while holding
-    /// the memtable.
+    /// Panics if a previous writer panicked while holding the log or the store.
     pub fn set(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        let seq = self.wal.set(key, value)?;
-        self.memtable.insert(key, seq, Some(value.to_vec()));
-        Ok(())
+        self.shared.write(key, Some(value))
     }
 
     /// Deletes `key`, writing a tombstone over it.
@@ -98,12 +237,10 @@ impl Engine {
     ///
     /// Same as [`Engine::set`].
     pub fn delete(&self, key: &[u8]) -> Result<()> {
-        let seq = self.wal.delete(key)?;
-        self.memtable.insert(key, seq, None);
-        Ok(())
+        self.shared.write(key, None)
     }
 
-    /// Pushes everything written so far to the device.
+    /// Pushes the log to the device.
     ///
     /// Only [`SyncPolicy::Interval`] leaves anything for this to do; the other
     /// policies have already flushed by the time a write returns.
@@ -114,33 +251,335 @@ impl Engine {
     ///
     /// # Panics
     ///
-    /// Panics if a previous writer panicked while appending.
+    /// Panics if a previous writer panicked while holding the log.
     pub fn sync(&self) -> Result<()> {
-        self.wal.sync()
+        self.shared.wal.read().expect(POISONED).sync()
     }
 
-    /// Keys held in memory, tombstones included.
+    /// Freezes the active memtable and waits until it is a file on disk. Does
+    /// nothing if the table is empty.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the rotation or the flush failed with.
     ///
     /// # Panics
     ///
-    /// Panics if a previous writer panicked while holding the memtable.
-    pub fn len(&self) -> usize {
-        self.memtable.len()
+    /// Panics if a previous writer panicked while holding the log or the store.
+    pub fn flush(&self) -> Result<()> {
+        self.shared.rotate(0)?;
+        self.shared.wait_for_flush()
     }
 
-    /// Whether the store holds nothing.
+    /// Waits until every frozen memtable is on disk.
+    ///
+    /// # Errors
+    ///
+    /// Whatever a background flush failed with.
     ///
     /// # Panics
     ///
-    /// Panics if a previous writer panicked while holding the memtable.
-    pub fn is_empty(&self) -> bool {
-        self.memtable.is_empty()
+    /// Panics if a previous writer panicked while holding the store.
+    pub fn wait_for_flush(&self) -> Result<()> {
+        self.shared.wait_for_flush()
+    }
+
+    /// Files the store holds.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a previous writer panicked while holding the store.
+    pub fn table_count(&self) -> usize {
+        self.shared.state.read().expect(POISONED).tables.len()
     }
 
     /// Directory the store lives in.
     pub fn dir(&self) -> &Path {
-        &self.dir
+        &self.shared.dir
     }
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        self.shared
+            .queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .shutdown = true;
+        self.shared.progress.notify_all();
+        if let Some(flusher) = self.flusher.take() {
+            let _ = flusher.join();
+        }
+        // Whatever is still in memory is still in a log, and recovery replays
+        // logs, so there is nothing to write out here.
+    }
+}
+
+impl Shared {
+    fn write(&self, key: &[u8], value: Option<&[u8]>) -> Result<()> {
+        if let Some(err) = self.take_flush_error() {
+            return Err(err);
+        }
+
+        let bytes = {
+            // Held for reading across both steps: a rotation takes this lock
+            // for writing, so the table this record lands in is the one the log
+            // it went to belongs to. Splitting the two would let a flush drop
+            // the log holding a record that never reached a file.
+            let wal = self.wal.read().expect(POISONED);
+            let seq = match value {
+                Some(value) => wal.set(key, value)?,
+                None => wal.delete(key)?,
+            };
+
+            let state = self.state.read().expect(POISONED);
+            state.active.insert(key, seq, value.map(<[u8]>::to_vec));
+            state.active.approx_bytes()
+        };
+
+        if bytes >= self.config.memtable_bytes {
+            self.rotate(self.config.memtable_bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Freezes the active memtable and starts a fresh log, unless the table is
+    /// empty or still smaller than `min_bytes`.
+    fn rotate(&self, min_bytes: usize) -> Result<()> {
+        let mut wal = self.wal.write().expect(POISONED);
+        let mut queue = self.queue.lock().expect(POISONED);
+        let mut state = self.state.write().expect(POISONED);
+
+        // Another writer may have rotated while this one waited for the lock.
+        if state.active.is_empty() || state.active.approx_bytes() < min_bytes {
+            return Ok(());
+        }
+
+        let number = self.next_number.fetch_add(1, Ordering::Relaxed);
+        let path = self.dir.join(file_name(number, LOG_EXT));
+        let fresh = Wal::create(&path, self.config.sync, wal.last_sequence())?;
+        let previous = std::mem::replace(&mut *wal, fresh);
+
+        let frozen = Frozen {
+            memtable: Arc::clone(&state.active),
+            logs: std::mem::replace(&mut state.active_logs, vec![path]),
+        };
+        state.frozen.insert(0, frozen);
+        state.active = Arc::new(Memtable::new());
+        queue.pending += 1;
+
+        drop(state);
+        drop(queue);
+        drop(wal);
+        // Closing the old log flushes it one last time, which is not something
+        // to do while writers are waiting on the lock.
+        drop(previous);
+        self.progress.notify_all();
+        Ok(())
+    }
+
+    /// The oldest frozen memtable, waiting for one to appear.
+    ///
+    /// `retry` spaces out the attempts after a failure instead of spinning on
+    /// the same table.
+    fn next_flush(&self, retry: bool) -> Option<Frozen> {
+        let mut queue = self.queue.lock().expect(POISONED);
+        loop {
+            if queue.shutdown {
+                return None;
+            }
+            if queue.pending > 0 {
+                if retry {
+                    let (guard, _) = self
+                        .progress
+                        .wait_timeout(queue, RETRY_DELAY)
+                        .expect(POISONED);
+                    queue = guard;
+                    if queue.shutdown {
+                        return None;
+                    }
+                }
+                let state = self.state.read().expect(POISONED);
+                return state.frozen.last().cloned();
+            }
+            queue = self.progress.wait(queue).expect(POISONED);
+        }
+    }
+
+    fn flush(&self, frozen: &Frozen) -> Result<()> {
+        let number = self.next_number.fetch_add(1, Ordering::Relaxed);
+        let table_path = self.dir.join(file_name(number, TABLE_EXT));
+        let partial_path = self
+            .dir
+            .join(format!("{}.{PARTIAL_EXT}", file_name(number, TABLE_EXT)));
+
+        let mut writer = Writer::create(&partial_path)?;
+        frozen
+            .memtable
+            .for_each(|key, seq, value| writer.add(key, seq, value))?;
+        writer.finish()?;
+
+        // The table takes its final name only once it is complete and on the
+        // device, so a crash mid-write leaves a file recovery can discard
+        // rather than one it would have to trust.
+        fs::rename(&partial_path, &table_path).map_err(|err| Error::io(&table_path, err))?;
+        // The directory entry has to be durable before the logs are unlinked,
+        // otherwise a crash could leave neither the logs nor the table.
+        sync_dir(&self.dir)?;
+        let table = Arc::new(SsTable::open(&table_path)?);
+
+        {
+            let mut queue = self.queue.lock().expect(POISONED);
+            let mut state = self.state.write().expect(POISONED);
+            debug_assert!(
+                state
+                    .frozen
+                    .last()
+                    .is_some_and(|oldest| Arc::ptr_eq(&oldest.memtable, &frozen.memtable)),
+                "the flusher publishes the table it was handed"
+            );
+            // Newer than every file, older than everything still in memory.
+            state.tables.insert(0, table);
+            state.frozen.pop();
+            queue.pending -= 1;
+        }
+        self.progress.notify_all();
+
+        for log in &frozen.logs {
+            fs::remove_file(log).map_err(|err| Error::io(log, err))?;
+        }
+        Ok(())
+    }
+
+    fn wait_for_flush(&self) -> Result<()> {
+        let mut queue = self.queue.lock().expect(POISONED);
+        loop {
+            if let Some(err) = self.take_flush_error() {
+                return Err(err);
+            }
+            if queue.pending == 0 {
+                return Ok(());
+            }
+            queue = self.progress.wait(queue).expect(POISONED);
+        }
+    }
+
+    fn take_flush_error(&self) -> Option<Error> {
+        self.flush_error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+
+    fn set_flush_error(&self, err: Error) {
+        let mut slot = self
+            .flush_error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if slot.is_none() {
+            *slot = Some(err);
+        }
+        drop(slot);
+        // Whoever is waiting on a flush has to hear about the failure.
+        self.progress.notify_all();
+    }
+}
+
+fn spawn_flusher(shared: &Arc<Shared>) -> JoinHandle<()> {
+    let shared = Arc::clone(shared);
+    thread::Builder::new()
+        .name("lsmkv-flush".to_owned())
+        .spawn(move || {
+            let mut retry = false;
+            while let Some(frozen) = shared.next_flush(retry) {
+                retry = match shared.flush(&frozen) {
+                    Ok(()) => false,
+                    Err(err) => {
+                        shared.set_flush_error(err);
+                        true
+                    }
+                };
+            }
+        })
+        .expect("spawn the flush thread")
+}
+
+/// Turns a lookup into an answer, or asks the caller to try an older level.
+fn answer(lookup: Lookup) -> ControlFlow<Option<Vec<u8>>> {
+    match lookup {
+        Lookup::Found(value) => ControlFlow::Break(Some(value)),
+        Lookup::Deleted => ControlFlow::Break(None),
+        Lookup::Missing => ControlFlow::Continue(()),
+    }
+}
+
+/// Applies a replayed record and returns its sequence number.
+fn apply(memtable: &Memtable, record: Record) -> u64 {
+    let seq = record.seq();
+    match record {
+        Record::Set { key, value, .. } => memtable.insert(&key, seq, Some(value)),
+        Record::Delete { key, .. } => memtable.insert(&key, seq, None),
+    };
+    seq
+}
+
+fn file_name(number: u64, extension: &str) -> String {
+    format!("{number:06}.{extension}")
+}
+
+fn sync_dir(dir: &Path) -> Result<()> {
+    let handle = File::open(dir).map_err(|err| Error::io(dir, err))?;
+    handle.sync_all().map_err(|err| Error::io(dir, err))
+}
+
+/// What a data directory holds, by file number.
+#[derive(Debug, Default)]
+struct Listing {
+    /// Log numbers, ascending.
+    logs: Vec<u64>,
+    /// Table numbers, ascending.
+    tables: Vec<u64>,
+    /// Tables left half-written by a crash.
+    partial: Vec<PathBuf>,
+    next_number: u64,
+}
+
+impl Listing {
+    fn scan(dir: &Path) -> Result<Self> {
+        let mut listing = Self::default();
+        let entries = fs::read_dir(dir).map_err(|err| Error::io(dir, err))?;
+        for entry in entries {
+            let path = entry.map_err(|err| Error::io(dir, err))?.path();
+            match path.extension().and_then(|ext| ext.to_str()) {
+                Some(PARTIAL_EXT) => listing.partial.push(path),
+                Some(LOG_EXT) => {
+                    if let Some(number) = file_number(&path) {
+                        listing.logs.push(number);
+                    }
+                }
+                Some(TABLE_EXT) => {
+                    if let Some(number) = file_number(&path) {
+                        listing.tables.push(number);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        listing.logs.sort_unstable();
+        listing.tables.sort_unstable();
+        listing.next_number = listing
+            .logs
+            .iter()
+            .chain(listing.tables.iter())
+            .max()
+            .map_or(1, |highest| highest + 1);
+        Ok(listing)
+    }
+}
+
+fn file_number(path: &Path) -> Option<u64> {
+    path.file_stem()?.to_str()?.parse().ok()
 }
 
 #[cfg(test)]
@@ -150,18 +589,36 @@ mod tests {
     use super::*;
     use crate::testutil::TempDir;
 
-    fn open(dir: &TempDir) -> Engine {
-        Engine::open(dir.join("store"), SyncPolicy::Group).expect("open")
+    fn config(memtable_bytes: usize) -> Config {
+        Config {
+            sync: SyncPolicy::Group,
+            memtable_bytes,
+        }
+    }
+
+    fn open(dir: &TempDir, memtable_bytes: usize) -> Engine {
+        Engine::open(dir.join("store"), config(memtable_bytes)).expect("open")
     }
 
     fn value(engine: &Engine, key: &[u8]) -> Option<Vec<u8>> {
         engine.get(key).expect("get")
     }
 
+    fn count_files(engine: &Engine, extension: &str) -> usize {
+        fs::read_dir(engine.dir())
+            .expect("read the directory")
+            .filter(|entry| {
+                entry.as_ref().is_ok_and(|entry| {
+                    entry.path().extension().and_then(|ext| ext.to_str()) == Some(extension)
+                })
+            })
+            .count()
+    }
+
     #[test]
     fn a_value_is_written_and_read_back() {
         let dir = TempDir::new();
-        let engine = open(&dir);
+        let engine = open(&dir, 4096);
 
         engine.set(b"user:1", b"nicolas").expect("set");
 
@@ -172,20 +629,19 @@ mod tests {
     #[test]
     fn a_delete_hides_the_value() {
         let dir = TempDir::new();
-        let engine = open(&dir);
+        let engine = open(&dir, 4096);
 
         engine.set(b"key", b"value").expect("set");
         engine.delete(b"key").expect("delete");
 
         assert_eq!(value(&engine, b"key"), None);
-        assert_eq!(engine.len(), 1, "the tombstone still holds the key");
     }
 
     #[test]
     fn the_store_comes_back_as_it_was_left() {
         let dir = TempDir::new();
         {
-            let engine = open(&dir);
+            let engine = open(&dir, 4096);
             engine.set(b"kept", b"1").expect("set");
             engine.set(b"replaced", b"first").expect("set");
             engine.set(b"replaced", b"second").expect("set");
@@ -193,7 +649,7 @@ mod tests {
             engine.delete(b"removed").expect("delete");
         }
 
-        let engine = open(&dir);
+        let engine = open(&dir, 4096);
         assert_eq!(value(&engine, b"kept"), Some(b"1".to_vec()));
         assert_eq!(value(&engine, b"replaced"), Some(b"second".to_vec()));
         assert_eq!(value(&engine, b"removed"), None);
@@ -203,29 +659,161 @@ mod tests {
     fn writes_after_a_reopen_still_win_over_replayed_ones() {
         let dir = TempDir::new();
         {
-            let engine = open(&dir);
+            let engine = open(&dir, 4096);
             engine.set(b"key", b"before").expect("set");
         }
 
-        let engine = open(&dir);
+        let engine = open(&dir, 4096);
         engine.set(b"key", b"after").expect("set");
-        assert_eq!(value(&engine, b"key"), Some(b"after".to_vec()));
         drop(engine);
 
-        // The sequence numbers of the new writes have to continue past the
-        // replayed ones, otherwise the older record wins on the next recovery.
-        let engine = open(&dir);
+        let engine = open(&dir, 4096);
         assert_eq!(value(&engine, b"key"), Some(b"after".to_vec()));
     }
 
     #[test]
-    fn memory_and_the_log_agree_after_concurrent_writers() {
-        const WRITERS: usize = 8;
-        const PER_WRITER: usize = 100;
-        const KEYS: usize = 20;
+    fn a_full_memtable_becomes_a_table() {
+        let dir = TempDir::new();
+        let engine = open(&dir, 4096);
+
+        assert_eq!(engine.table_count(), 0);
+        engine.set(b"key", b"value").expect("set");
+        engine.flush().expect("flush");
+
+        assert_eq!(engine.table_count(), 1);
+        assert_eq!(value(&engine, b"key"), Some(b"value".to_vec()));
+    }
+
+    #[test]
+    fn flushing_an_empty_store_does_nothing() {
+        let dir = TempDir::new();
+        let engine = open(&dir, 4096);
+
+        engine.flush().expect("flush");
+
+        assert_eq!(engine.table_count(), 0);
+    }
+
+    #[test]
+    fn a_log_is_deleted_once_its_table_exists() {
+        let dir = TempDir::new();
+        let engine = open(&dir, 4096);
+        engine.set(b"key", b"value").expect("set");
+        assert_eq!(count_files(&engine, LOG_EXT), 1);
+
+        engine.flush().expect("flush");
+
+        assert_eq!(count_files(&engine, TABLE_EXT), 1);
+        assert_eq!(
+            count_files(&engine, LOG_EXT),
+            1,
+            "the log the table replaced is gone, the fresh one remains"
+        );
+    }
+
+    #[test]
+    fn a_key_reached_through_an_older_table_is_still_found() {
+        let dir = TempDir::new();
+        let engine = open(&dir, 4096);
+
+        engine.set(b"first", b"1").expect("set");
+        engine.flush().expect("flush");
+        engine.set(b"second", b"2").expect("set");
+        engine.flush().expect("flush");
+        engine.set(b"third", b"3").expect("set");
+
+        assert_eq!(engine.table_count(), 2);
+        assert_eq!(value(&engine, b"first"), Some(b"1".to_vec()));
+        assert_eq!(value(&engine, b"second"), Some(b"2".to_vec()));
+        assert_eq!(value(&engine, b"third"), Some(b"3".to_vec()));
+    }
+
+    #[test]
+    fn a_tombstone_in_a_newer_table_hides_a_value_in_an_older_one() {
+        let dir = TempDir::new();
+        {
+            let engine = open(&dir, 4096);
+            engine.set(b"key", b"value").expect("set");
+            engine.flush().expect("flush");
+            engine.delete(b"key").expect("delete");
+            engine.flush().expect("flush");
+            assert_eq!(engine.table_count(), 2);
+            assert_eq!(value(&engine, b"key"), None);
+        }
+
+        // The tombstone has to survive the reopen too, or the older table's
+        // value would come back from the dead.
+        let engine = open(&dir, 4096);
+        assert_eq!(value(&engine, b"key"), None);
+    }
+
+    #[test]
+    fn a_newer_value_wins_over_the_one_in_a_table() {
+        let dir = TempDir::new();
+        let engine = open(&dir, 4096);
+
+        engine.set(b"key", b"old").expect("set");
+        engine.flush().expect("flush");
+        engine.set(b"key", b"new").expect("set");
+        engine.flush().expect("flush");
+
+        assert_eq!(value(&engine, b"key"), Some(b"new".to_vec()));
+    }
+
+    #[test]
+    fn a_partial_table_left_by_a_crash_is_dropped() {
+        let dir = TempDir::new();
+        let engine = open(&dir, 4096);
+        engine.set(b"key", b"value").expect("set");
+        let leftover = engine.dir().join("000042.sst.tmp");
+        fs::write(&leftover, b"half a table").expect("write");
+        drop(engine);
+
+        let engine = open(&dir, 4096);
+
+        assert!(!leftover.exists(), "a partial table must not be kept");
+        assert_eq!(value(&engine, b"key"), Some(b"value".to_vec()));
+    }
+
+    #[test]
+    fn every_key_survives_repeated_flushes_and_a_reopen() {
+        const KEYS: usize = 400;
 
         let dir = TempDir::new();
-        let engine = open(&dir);
+        {
+            // Small enough that the writes below flush several times.
+            let engine = open(&dir, 512);
+            for i in 0..KEYS {
+                let key = format!("key:{i:04}");
+                engine
+                    .set(key.as_bytes(), format!("value:{i}").as_bytes())
+                    .expect("set");
+            }
+            engine.wait_for_flush().expect("wait");
+            assert!(engine.table_count() > 1, "the writes must have flushed");
+        }
+
+        let engine = open(&dir, 512);
+        for i in 0..KEYS {
+            let key = format!("key:{i:04}");
+            assert_eq!(
+                value(&engine, key.as_bytes()),
+                Some(format!("value:{i}").into_bytes()),
+                "key {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn memory_and_the_files_agree_after_concurrent_writers() {
+        const WRITERS: usize = 8;
+        const PER_WRITER: usize = 200;
+        // Only 40 distinct keys, so the threshold has to sit below what those
+        // keys weigh for the writes to flush at all.
+        const KEYS: usize = 40;
+
+        let dir = TempDir::new();
+        let engine = open(&dir, 256);
 
         thread::scope(|scope| {
             for writer in 0..WRITERS {
@@ -243,19 +831,21 @@ mod tests {
                 });
             }
         });
+        engine.wait_for_flush().expect("wait");
 
         let keys: Vec<String> = (0..KEYS).map(|i| format!("key:{i}")).collect();
         let in_memory: Vec<Option<Vec<u8>>> =
             keys.iter().map(|k| value(&engine, k.as_bytes())).collect();
+        assert!(engine.table_count() > 1, "the writes must have flushed");
         drop(engine);
 
-        let engine = open(&dir);
-        let replayed: Vec<Option<Vec<u8>>> =
+        let engine = open(&dir, 256);
+        let recovered: Vec<Option<Vec<u8>>> =
             keys.iter().map(|k| value(&engine, k.as_bytes())).collect();
 
         assert_eq!(
-            in_memory, replayed,
-            "what memory held must be what the log rebuilds"
+            in_memory, recovered,
+            "what the store answered must be what it answers after recovery"
         );
     }
 

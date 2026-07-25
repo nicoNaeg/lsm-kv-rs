@@ -55,25 +55,25 @@ Apple M4 Pro, 12 cores, macOS 26.5. Keys of 16 bytes, values of 100, each config
 
 | policy | threads | appends | flushes | appends per flush | appends/s | mean latency |
 |--------|---------|---------|---------|-------------------|-----------|--------------|
-| always | 1 | 784 | 785 | 1.0 | 260 | 3844 µs |
-| always | 8 | 912 | 913 | 1.0 | 264 | 30316 µs |
-| group | 1 | 800 | 800 | 1.0 | 262 | 3815 µs |
-| group | 8 | 3200 | 792 | 4.0 | 1036 | 7725 µs |
-| interval 10ms | 1 | 100000 | 12 | 8333.3 | 512943 | 2 µs |
-| interval 10ms | 8 | 100000 | 23 | 4347.8 | 271031 | 30 µs |
+| always | 1 | 800 | 801 | 1.0 | 262 | 3815 µs |
+| always | 8 | 912 | 913 | 1.0 | 260 | 30746 µs |
+| group | 1 | 800 | 800 | 1.0 | 261 | 3828 µs |
+| group | 8 | 3200 | 796 | 4.0 | 1036 | 7722 µs |
+| interval 10ms | 1 | 100000 | 12 | 8333.3 | 518361 | 2 µs |
+| interval 10ms | 8 | 100000 | 23 | 4347.8 | 265941 | 30 µs |
 
 On macOS, `File::sync_data` issues `F_FULLFSYNC`, which drains the drive's own write cache: 3.8 ms per flush here. The same code on Linux calls `fdatasync`, an order of magnitude cheaper, so these are the pessimistic numbers.
 
-Adding writers does nothing for `Always` (260 to 264 appends/s) because every append holds the log while it waits for the device. `Group` is identical with one writer, since there is nothing to share, and 3.9 times faster with eight, at an unchanged guarantee: per-append latency drops from 30 ms to 7.7 ms.
+Adding writers does nothing for `Always` (262 against 260 appends/s) because every append holds the log while it waits for the device. `Group` is identical with one writer, since there is nothing to share, and just under four times faster with eight, at an unchanged guarantee: per-append latency drops from 31 ms to 7.7 ms.
 
-Two results are worth more than the headline. Group commit batches 4 appends per flush where 8 are available, because the writer that owns a round starts the next flush before the writers it just released have queued their next record; holding a round open for a few microseconds, the commit delay of PostgreSQL, should close that gap and will be measured rather than assumed. And `Interval` is slower with eight writers than with one (271k against 513k appends/s): once the device is out of the way, the single append lock and its one write syscall per record become the bottleneck. That is the first thing the profiling stage will look at.
+Two results are worth more than the headline. Group commit batches 4 appends per flush where 8 are available, because the writer that owns a round starts the next flush before the writers it just released have queued their next record; holding a round open for a few microseconds, the commit delay of PostgreSQL, should close that gap and will be measured rather than assumed. And `Interval` is slower with eight writers than with one (266k against 518k appends/s): once the device is out of the way, the single append lock and its one write syscall per record become the bottleneck. That is the first thing the profiling stage will look at.
 
 ## Memtable and engine
 
 ```rust
-use lsmkv::{Engine, SyncPolicy};
+use lsmkv::{Config, Engine};
 
-let db = Engine::open("data", SyncPolicy::default())?;
+let db = Engine::open("data", Config::default())?;
 db.set(b"user:1", b"nicolas")?;
 assert_eq!(db.get(b"user:1")?, Some(b"nicolas".to_vec()));
 db.delete(b"user:1")?;
@@ -83,9 +83,41 @@ A write is appended to the log, and only then applied to the sorted in-memory ta
 
 One lock over the whole table rather than shards, because every write already passes through the log's single append lock, which the stage 1 numbers identify as the real serialization point. Sharding the table would optimize the wrong lock, and hash sharding would also cost the global sorted order the flush depends on.
 
-Each entry carries the sequence number the log gave its record, and an entry is replaced only by a higher one. Concurrent writers append to the log in one order and reach the table in another, so without that rule two writers racing on the same key can leave memory holding one value and the log another, and the store would silently change state on restart. The test that pins it down is `memory_and_the_log_agree_after_concurrent_writers`: eight threads write and delete over twenty shared keys, then the store is reopened and every key has to read back what memory held. Sequence numbers also have to continue past what recovery replayed, otherwise a fresh write looks older than the record it replaces.
+Each entry carries the sequence number the log gave its record, and an entry is replaced only by a higher one. Concurrent writers append to the log in one order and reach the table in another, so without that rule two writers racing on the same key can leave memory holding one value and the log another, and the store would silently change state on restart. The test that pins it down is `memory_and_the_files_agree_after_concurrent_writers`: eight threads write and delete over forty shared keys, flushing several times along the way, then the store is reopened and every key has to read back what it answered before. Sequence numbers also have to continue past what recovery replayed, otherwise a fresh write looks older than the record it replaces.
 
 A delete writes a tombstone instead of erasing the entry, because the key may still live in an older file on disk. The tombstone is what shadows it until compaction drops both.
+
+## Sorted files on disk
+
+A memtable that passes its size limit is frozen and a fresh log is started, then a background thread writes the frozen table out as a sorted file. Writes keep landing in the new table while that happens, which is the point of freezing rather than blocking.
+
+```text
+file   := block* index footer
+block  := record* crc32
+record := seq | kind | key_len | key | value_len | value
+index  := key range | (first key of the block, offset, length)* crc32
+footer := index offset and length | entry count | crc32 | version | magic
+```
+
+Blocks are 4 KiB, the default of LevelDB and RocksDB, because this workload is point lookups: a GET should read one page to return one value, not a chunk sized for scans. The index holds the first key of every block plus the key range of the file, so a lookup rejects the file outright when the key falls outside that range, binary searches the index in memory otherwise, and reads exactly one block. On entries of about 116 bytes that index is roughly 0.7% of the file, and it is loaded once when the file is opened.
+
+The checksum covers a block, which is also the unit of I/O: 4 bytes per 4 KiB, one verification amortized over the tens of records a block holds. Per record it would cost 3.4% of the file and a checksum per record read; per file it could not be verified without reading everything.
+
+Keys are stored whole. Prefix compression pays exactly as much as the key distribution allows and there is no measurement yet, so it is a candidate for the profiling stage, with file size and lookup latency measured before and after rather than assumed.
+
+### What a crash during a flush must not cost
+
+Three orderings carry the guarantee, each against a failure that would otherwise lose data:
+
+- the file is written under a temporary name and takes its final one only once it is complete and on the device, so a crash mid-flush leaves a file recovery deletes instead of one it would have to trust;
+- the directory entry is flushed before any log is unlinked, otherwise a crash could leave neither the log nor the file;
+- the logs go last. A crash before that leaves logs whose records already sit in a file, and replaying them is harmless: the memtable they rebuild holds the same values and shadows the file anyway.
+
+### Reading across levels
+
+A lookup walks the active memtable, then the frozen ones, then the files from newest to oldest, and stops at the first level that answers. This is where the three-way answer earns its keep: a value and a tombstone both stop the search, and only "not here" continues to older levels. A key deleted after its value reached a file is exactly that, a tombstone in a newer level shadowing an older file.
+
+One limitation worth naming: sequence numbers restart at 1 once every log has been flushed away, because nothing on disk persists the counter. It costs nothing today, since the level a value sits in decides whether it wins rather than the number it carries. The manifest of stage 5 is where that counter gets written down.
 
 ## Build order
 
@@ -93,14 +125,14 @@ Each stage lands with its tests before the next one starts.
 
 1. **Write-ahead log** (built): append-only records with a per-record checksum, replayed at startup to rebuild the memtable, with the three sync policies measured above.
 2. **Memtable and engine API** (built): sorted in-memory table, `get`, `set` and `delete` with tombstones, backed by the WAL and ordered by its sequence numbers.
-3. **SSTable**: writer and reader, sorted blocks, sparse index and footer at the end of the file, background flush of a full memtable.
-4. **Read path**: memtable, then immutable memtable, then files from newest to oldest, with a Bloom filter per file.
+3. **Sorted files** (built): writer and reader, 4 KiB blocks, sparse index and footer, log rotation and background flush of a full memtable.
+4. **Bloom filters**: one per file, so a lookup skips a file it cannot hold the key without touching the disk.
 5. **Compaction**: background merge, tombstone purge, manifest describing the live set of files.
 6. **Server**: RESP2 subset on tokio, so redis-cli and redis-benchmark drive the engine unchanged.
 7. **Benchmarks and profiling**: criterion micro-benchmarks, redis-benchmark end to end, flamegraph of the hot path.
 8. **Skiplist memtable**: hand-written concurrent skiplist measured against the BTreeMap baseline. The memtable interface is extracted then, from two implementations rather than from one.
 
-Current stage: 3.
+Current stage: 4.
 
 ## Benchmarking
 

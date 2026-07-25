@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 use std::sync::RwLock;
 
+use crate::error::Result;
 use crate::lookup::Lookup;
 
 /// A panic while the table was being modified leaves its size accounting
@@ -108,6 +109,31 @@ impl Memtable {
     /// Panics if a previous writer panicked while holding the table.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Visits every entry in key order, which is the order a sorted file on
+    /// disk needs them in.
+    ///
+    /// The table is held for reading throughout, so other readers are
+    /// unaffected. This is only ever called on a table that no longer takes
+    /// writes.
+    ///
+    /// # Errors
+    ///
+    /// Whatever `visit` returns, at the first entry that fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a previous writer panicked while holding the table.
+    pub fn for_each(
+        &self,
+        mut visit: impl FnMut(&[u8], u64, Option<&[u8]>) -> Result<()>,
+    ) -> Result<()> {
+        let inner = self.inner.read().expect(POISONED);
+        for (key, entry) in &inner.entries {
+            visit(key, entry.seq, entry.value.as_deref())?;
+        }
+        Ok(())
     }
 
     /// Key and value bytes held, which is what the flush threshold is compared

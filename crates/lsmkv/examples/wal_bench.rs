@@ -56,7 +56,7 @@ fn main() {
 }
 
 fn measure(policy: &'static str, sync: SyncPolicy, threads: usize, path: &Path) -> Measurement {
-    let (wal, _) = Wal::recover(path, sync).expect("open the log");
+    let (wal, _) = Wal::recover(path, sync, 0).expect("open the log");
     let value = vec![b'v'; VALUE_SIZE];
     let per_thread = MAX_APPENDS / threads as u64;
     let appends = AtomicU64::new(0);

@@ -27,7 +27,7 @@ use std::time::Duration;
 use crate::error::{Error, Result};
 
 const MAGIC: &[u8] = b"LSMKVWAL";
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 const FILE_HEADER_LEN: usize = 12;
 /// Same, for arithmetic on file offsets.
 const FILE_HEADER_LEN_U64: u64 = FILE_HEADER_LEN as u64;
@@ -76,9 +76,9 @@ struct Shared {
     policy: SyncPolicy,
     /// Serializes appends and carries the encoding buffer they reuse.
     append: Mutex<Vec<u8>>,
-    /// Records whose bytes reached the operating system. Bumped under the
-    /// append lock, read without it.
-    written: AtomicU64,
+    /// Sequence number of the last record whose bytes reached the operating
+    /// system. Bumped under the append lock, read without it.
+    last_seq: AtomicU64,
     sync: Mutex<SyncState>,
     synced: Condvar,
     flushes: AtomicU64,
@@ -90,7 +90,7 @@ struct Shared {
 
 #[derive(Debug, Default)]
 struct SyncState {
-    /// Records covered by a completed flush.
+    /// Sequence number covered by the last completed flush.
     durable: u64,
     /// Whether a flush is in flight, so latecomers wait for it instead of
     /// starting a second one.
@@ -104,11 +104,20 @@ impl Wal {
     /// crash is discarded before the log is reopened for appending, so the
     /// returned log always continues from the last intact record.
     ///
+    /// `last_seq` is the highest sequence number the store has already used
+    /// elsewhere, in older logs or in files on disk. Numbering continues past
+    /// the larger of that and what this file holds, so a fresh record can never
+    /// look older than the one it replaces.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Corrupt`] if the file is not a log of this format, and
     /// [`Error::Io`] if it cannot be read, created or truncated.
-    pub fn recover(path: impl AsRef<Path>, policy: SyncPolicy) -> Result<(Self, Vec<Record>)> {
+    pub fn recover(
+        path: impl AsRef<Path>,
+        policy: SyncPolicy,
+        last_seq: u64,
+    ) -> Result<(Self, Vec<Record>)> {
         let path = path.as_ref();
         let mut replay = Replay::open(path)?;
         let mut records = Vec::new();
@@ -141,13 +150,27 @@ impl Wal {
             truncate(&file, path, valid_len)?;
         }
 
-        // Sequence numbers continue where the file stops: the records just
-        // replayed keep the numbers 1 to N, and they are already durable.
-        let recovered = records.len() as u64;
+        let last_seq = records
+            .iter()
+            .map(Record::seq)
+            .max()
+            .map_or(last_seq, |highest| highest.max(last_seq));
         Ok((
-            Self::new(path.to_path_buf(), file, policy, recovered),
+            Self::new(path.to_path_buf(), file, policy, last_seq),
             records,
         ))
+    }
+
+    /// Opens a log that is expected to be new, for a store that has already
+    /// used sequence numbers up to `last_seq`.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Wal::recover`].
+    pub fn create(path: impl AsRef<Path>, policy: SyncPolicy, last_seq: u64) -> Result<Self> {
+        let (wal, records) = Self::recover(path, policy, last_seq)?;
+        debug_assert!(records.is_empty(), "a fresh log cannot hold records");
+        Ok(wal)
     }
 
     /// Reads a log file without opening it for appending.
@@ -159,15 +182,15 @@ impl Wal {
         Replay::open(path.as_ref())
     }
 
-    fn new(path: PathBuf, file: File, policy: SyncPolicy, recovered: u64) -> Self {
+    fn new(path: PathBuf, file: File, policy: SyncPolicy, last_seq: u64) -> Self {
         let shared = Arc::new(Shared {
             path,
             file,
             policy,
             append: Mutex::new(Vec::new()),
-            written: AtomicU64::new(recovered),
+            last_seq: AtomicU64::new(last_seq),
             sync: Mutex::new(SyncState {
-                durable: recovered,
+                durable: last_seq,
                 in_progress: false,
             }),
             synced: Condvar::new(),
@@ -226,7 +249,7 @@ impl Wal {
     ///
     /// Panics if a previous writer panicked while appending.
     pub fn sync(&self) -> Result<()> {
-        let target = self.shared.written.load(Ordering::Acquire);
+        let target = self.shared.last_seq.load(Ordering::Acquire);
         self.shared.sync_through(target)
     }
 
@@ -238,10 +261,10 @@ impl Wal {
         self.shared.flushes.load(Ordering::Relaxed)
     }
 
-    /// Records the log holds, the ones replayed at recovery included. This is
-    /// also the sequence number of the most recent append.
-    pub fn record_count(&self) -> u64 {
-        self.shared.written.load(Ordering::Acquire)
+    /// Highest sequence number this log has handed out, replayed records
+    /// included. The next append gets the one after it.
+    pub fn last_sequence(&self) -> u64 {
+        self.shared.last_seq.load(Ordering::Acquire)
     }
 
     /// Path of the log file.
@@ -280,11 +303,14 @@ impl Shared {
 
         let seq = {
             let mut buf = self.append.lock().expect(POISONED);
-            record::encode(&mut buf, key, value)?;
+            // Only one appender at a time, so reading the counter and bumping
+            // it below cannot race.
+            let seq = self.last_seq.load(Ordering::Relaxed) + 1;
+            record::encode(&mut buf, seq, key, value)?;
             (&self.file)
                 .write_all(&buf)
                 .map_err(|err| Error::io(&self.path, err))?;
-            let seq = self.written.fetch_add(1, Ordering::Release) + 1;
+            self.last_seq.store(seq, Ordering::Release);
             if self.policy == SyncPolicy::Always {
                 // Held on purpose: one flush per append, serialized behind the
                 // append lock, is exactly what this policy promises.
@@ -314,7 +340,7 @@ impl Shared {
             // This thread owns the next flush. It covers every record written
             // so far, which includes its own and everything appended by the
             // writers that will wait on it.
-            let target = self.written.load(Ordering::Acquire);
+            let target = self.last_seq.load(Ordering::Acquire);
             state.in_progress = true;
             drop(state);
 
@@ -375,7 +401,7 @@ fn spawn_syncer(shared: &Arc<Shared>, interval: Duration) -> JoinHandle<()> {
         .spawn(move || {
             loop {
                 let stopping = shared.wait_while_running(interval);
-                let target = shared.written.load(Ordering::Acquire);
+                let target = shared.last_seq.load(Ordering::Acquire);
                 if let Err(err) = shared.sync_through(target) {
                     shared.set_background_error(err);
                 }
@@ -401,7 +427,7 @@ mod tests {
     use crate::testutil::TempDir;
 
     fn records(path: &Path) -> Vec<Record> {
-        let (_wal, records) = Wal::recover(path, SyncPolicy::Group).expect("recover");
+        let (_wal, records) = Wal::recover(path, SyncPolicy::Group, 0).expect("recover");
         records
     }
 
@@ -423,7 +449,7 @@ mod tests {
         let dir = TempDir::new();
         let path = dir.join("wal");
 
-        let (wal, replayed) = Wal::recover(&path, SyncPolicy::Group).expect("recover");
+        let (wal, replayed) = Wal::recover(&path, SyncPolicy::Group, 0).expect("recover");
 
         assert!(replayed.is_empty());
         assert_eq!(file_len(wal.path()), FILE_HEADER_LEN_U64);
@@ -435,7 +461,7 @@ mod tests {
         let path = dir.join("wal");
 
         {
-            let (wal, _) = Wal::recover(&path, SyncPolicy::Group).expect("recover");
+            let (wal, _) = Wal::recover(&path, SyncPolicy::Group, 0).expect("recover");
             wal.set(b"a", b"1").expect("set");
             wal.set(b"b", b"2").expect("set");
             wal.delete(b"a").expect("delete");
@@ -446,15 +472,21 @@ mod tests {
             records(&path),
             vec![
                 Record::Set {
+                    seq: 1,
                     key: b"a".to_vec(),
                     value: b"1".to_vec()
                 },
                 Record::Set {
+                    seq: 2,
                     key: b"b".to_vec(),
                     value: b"2".to_vec()
                 },
-                Record::Delete { key: b"a".to_vec() },
+                Record::Delete {
+                    seq: 3,
+                    key: b"a".to_vec()
+                },
                 Record::Set {
+                    seq: 4,
                     key: b"a".to_vec(),
                     value: b"3".to_vec()
                 },
@@ -468,7 +500,7 @@ mod tests {
         let path = dir.join("wal");
 
         let intact_len = {
-            let (wal, _) = Wal::recover(&path, SyncPolicy::Always).expect("recover");
+            let (wal, _) = Wal::recover(&path, SyncPolicy::Always, 0).expect("recover");
             wal.set(b"first", b"1").expect("set");
             wal.set(b"second", b"2").expect("set");
             let len = file_len(&path);
@@ -479,7 +511,7 @@ mod tests {
         // What a crash in the middle of the third append leaves behind.
         set_len(&path, intact_len + 3);
 
-        let (wal, replayed) = Wal::recover(&path, SyncPolicy::Always).expect("recover");
+        let (wal, replayed) = Wal::recover(&path, SyncPolicy::Always, 0).expect("recover");
         assert_eq!(replayed.len(), 2);
         assert_eq!(replayed[1].key(), b"second");
         assert_eq!(file_len(&path), intact_len);
@@ -498,7 +530,7 @@ mod tests {
         let path = dir.join("wal");
 
         let first_len = {
-            let (wal, _) = Wal::recover(&path, SyncPolicy::Always).expect("recover");
+            let (wal, _) = Wal::recover(&path, SyncPolicy::Always, 0).expect("recover");
             wal.set(b"first", b"1").expect("set");
             let len = file_len(&path);
             wal.set(b"second", b"2").expect("set");
@@ -524,7 +556,7 @@ mod tests {
         let path = dir.join("wal");
         std::fs::write(&path, b"this is not a log file at all").expect("write");
 
-        let err = Wal::recover(&path, SyncPolicy::Group).expect_err("must reject");
+        let err = Wal::recover(&path, SyncPolicy::Group, 0).expect_err("must reject");
         assert!(matches!(err, Error::Corrupt { .. }), "{err}");
     }
 
@@ -534,7 +566,7 @@ mod tests {
         let path = dir.join("wal");
         std::fs::write(&path, b"").expect("write");
 
-        let (wal, replayed) = Wal::recover(&path, SyncPolicy::Group).expect("recover");
+        let (wal, replayed) = Wal::recover(&path, SyncPolicy::Group, 0).expect("recover");
         assert!(replayed.is_empty());
         wal.set(b"k", b"v").expect("set");
         drop(wal);
@@ -548,7 +580,7 @@ mod tests {
         let path = dir.join("wal");
         std::fs::write(&path, &MAGIC[..4]).expect("write");
 
-        let (wal, replayed) = Wal::recover(&path, SyncPolicy::Group).expect("recover");
+        let (wal, replayed) = Wal::recover(&path, SyncPolicy::Group, 0).expect("recover");
         assert!(replayed.is_empty());
         assert_eq!(file_len(&path), FILE_HEADER_LEN_U64);
         wal.set(b"k", b"v").expect("set");
@@ -561,7 +593,7 @@ mod tests {
     fn every_append_flushes_under_always() {
         let dir = TempDir::new();
         let path = dir.join("wal");
-        let (wal, _) = Wal::recover(&path, SyncPolicy::Always).expect("recover");
+        let (wal, _) = Wal::recover(&path, SyncPolicy::Always, 0).expect("recover");
 
         for i in 0..10u8 {
             wal.set(&[i], b"v").expect("set");
@@ -577,7 +609,7 @@ mod tests {
 
         let dir = TempDir::new();
         let path = dir.join("wal");
-        let (wal, _) = Wal::recover(&path, SyncPolicy::Group).expect("recover");
+        let (wal, _) = Wal::recover(&path, SyncPolicy::Group, 0).expect("recover");
         let start = Barrier::new(WRITERS);
 
         thread::scope(|scope| {
@@ -595,7 +627,7 @@ mod tests {
         });
 
         let appends = (WRITERS * PER_WRITER) as u64;
-        assert_eq!(wal.record_count(), appends);
+        assert_eq!(wal.last_sequence(), appends);
         assert!(
             wal.flush_count() < appends,
             "{} flushes for {appends} appends, nothing was amortized",
@@ -610,8 +642,8 @@ mod tests {
     fn the_interval_policy_flushes_in_the_background() {
         let dir = TempDir::new();
         let path = dir.join("wal");
-        let (wal, _) =
-            Wal::recover(&path, SyncPolicy::Interval(Duration::from_millis(5))).expect("recover");
+        let (wal, _) = Wal::recover(&path, SyncPolicy::Interval(Duration::from_millis(5)), 0)
+            .expect("recover");
 
         for i in 0..100u8 {
             wal.set(&[i], b"v").expect("set");
@@ -629,14 +661,14 @@ mod tests {
         let path = dir.join("wal");
 
         {
-            let (wal, _) = Wal::recover(&path, SyncPolicy::Group).expect("recover");
+            let (wal, _) = Wal::recover(&path, SyncPolicy::Group, 0).expect("recover");
             assert_eq!(wal.set(b"a", b"1").expect("set"), 1);
             assert_eq!(wal.set(b"b", b"2").expect("set"), 2);
         }
 
-        let (wal, replayed) = Wal::recover(&path, SyncPolicy::Group).expect("recover");
+        let (wal, replayed) = Wal::recover(&path, SyncPolicy::Group, 0).expect("recover");
         assert_eq!(replayed.len(), 2);
-        assert_eq!(wal.record_count(), 2);
+        assert_eq!(wal.last_sequence(), 2);
         // Restarting the numbering here would make a new write look older than
         // the record it replaces.
         assert_eq!(wal.set(b"a", b"3").expect("set"), 3);
