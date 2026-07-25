@@ -27,7 +27,7 @@ use crate::compaction::{self, Merge};
 use crate::error::{Error, Result};
 use crate::lookup::Lookup;
 use crate::manifest::{FileMeta, Manifest, Snapshot};
-use crate::memtable::Memtable;
+use crate::memtable::{BTreeMemtable, Memtable};
 use crate::sstable::{SsTable, Writer};
 use crate::wal::{Record, SyncPolicy, Wal};
 
@@ -123,7 +123,7 @@ struct FlushQueue {
 
 #[derive(Debug)]
 struct State {
-    active: Arc<Memtable>,
+    active: Arc<dyn Memtable>,
     /// Logs holding the active table's records.
     active_logs: Vec<PathBuf>,
     /// Tables frozen but not yet on disk, newest first.
@@ -192,7 +192,7 @@ fn covering<'a>(level: &'a [Table], key: &[u8]) -> Option<&'a Table> {
 /// A memtable waiting to become a file, and the logs that still hold it.
 #[derive(Debug, Clone)]
 struct Frozen {
-    memtable: Arc<Memtable>,
+    memtable: Arc<dyn Memtable>,
     logs: Vec<PathBuf>,
 }
 
@@ -237,7 +237,7 @@ impl Engine {
         }
 
         let levels = open_levels(&dir, &snapshot)?;
-        let active = Memtable::new();
+        let active: Arc<dyn Memtable> = Arc::new(BTreeMemtable::new());
         let mut active_logs = Vec::new();
         let mut next_number = listing.next_number.max(snapshot.next_number);
         // Numbering picks up where the manifest left it, so it survives a store
@@ -250,14 +250,14 @@ impl Engine {
             for number in older {
                 let path = dir.join(file_name(*number, LOG_EXT));
                 for record in Wal::replay(&path)? {
-                    last_seq = last_seq.max(apply(&active, record?));
+                    last_seq = last_seq.max(apply(active.as_ref(), record?));
                 }
                 active_logs.push(path);
             }
             let path = dir.join(file_name(*newest, LOG_EXT));
             let (wal, records) = Wal::recover(&path, config.sync, last_seq)?;
             for record in records {
-                apply(&active, record);
+                apply(active.as_ref(), record);
             }
             active_logs.push(path);
             wal
@@ -279,7 +279,7 @@ impl Engine {
             progress: Condvar::new(),
             durable: Mutex::new(Durable { manifest, snapshot }),
             state: RwLock::new(State {
-                active: Arc::new(active),
+                active,
                 active_logs,
                 frozen: Vec::new(),
                 levels,
@@ -567,7 +567,7 @@ impl Shared {
             logs: std::mem::replace(&mut state.active_logs, vec![path]),
         };
         state.frozen.insert(0, frozen);
-        state.active = Arc::new(Memtable::new());
+        state.active = Arc::new(BTreeMemtable::new());
         // Always the count of frozen tables rather than a running total, so no
         // failure path can leave the two disagreeing.
         queue.pending = state.frozen.len();
@@ -625,7 +625,7 @@ impl Shared {
         let mut writer = Writer::create(&partial_path)?;
         frozen
             .memtable
-            .for_each(|key, seq, value| writer.add(key, seq, value))?;
+            .for_each(&mut |key, seq, value| writer.add(key, seq, value))?;
         writer.finish()?;
 
         // The table takes its final name only once it is complete and on the
@@ -900,7 +900,7 @@ fn answer(lookup: Lookup) -> ControlFlow<Option<Vec<u8>>> {
 }
 
 /// Applies a replayed record and returns its sequence number.
-fn apply(memtable: &Memtable, record: Record) -> u64 {
+fn apply(memtable: &dyn Memtable, record: Record) -> u64 {
     let seq = record.seq();
     match record {
         Record::Set { key, value, .. } => memtable.insert(&key, seq, Some(value)),

@@ -20,7 +20,7 @@ use std::thread;
 use std::time::Duration;
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
-use lsmkv::Memtable;
+use lsmkv::{BTreeMemtable, Memtable};
 
 /// Entries the table already holds when a measurement starts.
 const FILLED: usize = 100_000;
@@ -35,8 +35,8 @@ fn key(i: usize) -> [u8; 16] {
     key
 }
 
-fn filled() -> Memtable {
-    let table = Memtable::new();
+fn filled() -> BTreeMemtable {
+    let table = BTreeMemtable::new();
     let value = vec![b'v'; VALUE_SIZE];
     for i in 0..FILLED {
         table.insert(&key(i), i as u64 + 1, Some(value.clone()));
@@ -44,7 +44,7 @@ fn filled() -> Memtable {
     table
 }
 
-fn insert_batch(table: &Memtable, value: &[u8]) {
+fn insert_batch(table: &BTreeMemtable, value: &[u8]) {
     for i in FILLED..FILLED + BATCH {
         table.insert(&key(i), i as u64 + 1, Some(value.to_vec()));
     }
@@ -59,7 +59,7 @@ fn insert(c: &mut Criterion) {
 
     group.bench_function("into an empty table", |b| {
         b.iter_batched_ref(
-            Memtable::new,
+            BTreeMemtable::new,
             |table| insert_batch(table, &value),
             BatchSize::PerIteration,
         );
