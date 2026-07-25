@@ -12,6 +12,7 @@
 pub mod bloom;
 mod checksum;
 mod coding;
+pub mod compaction;
 mod engine;
 pub mod error;
 mod lookup;

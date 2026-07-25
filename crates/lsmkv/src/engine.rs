@@ -14,6 +14,7 @@
 //! Locks are always taken in this order: the log, the durable state, the flush
 //! queue, then the state in memory.
 
+use std::cmp::Ordering as CmpOrdering;
 use std::fs::{self, File};
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
@@ -22,6 +23,7 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use crate::compaction::{self, Merge};
 use crate::error::{Error, Result};
 use crate::lookup::Lookup;
 use crate::manifest::{FileMeta, Manifest, Snapshot};
@@ -43,8 +45,14 @@ pub struct Config {
     /// When the log is pushed to the device.
     pub sync: SyncPolicy,
     /// Key and value bytes the active memtable holds before it is frozen and
-    /// written to disk.
+    /// written to disk. Also the size a compaction cuts its output files at.
     pub memtable_bytes: usize,
+    /// Files at level 0 before a compaction is triggered. Level 0 files overlap,
+    /// so each one costs a lookup.
+    pub l0_trigger: usize,
+    /// How much bigger each level is than the one above it. Level 1 is budgeted
+    /// at `memtable_bytes * fanout`.
+    pub fanout: u64,
 }
 
 impl Default for Config {
@@ -52,6 +60,8 @@ impl Default for Config {
         Self {
             sync: SyncPolicy::default(),
             memtable_bytes: 4 * 1024 * 1024,
+            l0_trigger: 4,
+            fanout: 10,
         }
     }
 }
@@ -84,8 +94,16 @@ struct Shared {
     state: RwLock<State>,
     /// Next number for a log or a table. The two share one numbering space.
     next_number: AtomicU64,
-    /// Failure of a background flush, reported to the next caller that can.
-    flush_error: Mutex<Option<Error>>,
+    /// Serializes compactions, so two of them never pick the same files. A
+    /// flush does not take it: it only ever adds a file at level 0.
+    compacting: Mutex<()>,
+    /// Bytes written into files since the store was opened, flushes and
+    /// compactions together. Against the bytes handed to `set`, this is the
+    /// write amplification.
+    bytes_written: AtomicU64,
+    /// Failure of a background flush or compaction, reported to the next caller
+    /// that can.
+    background_error: Mutex<Option<Error>>,
 }
 
 #[derive(Debug)]
@@ -98,6 +116,8 @@ struct Durable {
 struct FlushQueue {
     /// Frozen memtables not yet on disk.
     pending: usize,
+    /// Whether the shape of the levels changed since it was last examined.
+    shape_changed: bool,
     shutdown: bool,
 }
 
@@ -110,7 +130,63 @@ struct State {
     frozen: Vec<Frozen>,
     /// Files by level. Level 0 holds files that may overlap, newest first;
     /// deeper levels hold files that never overlap, sorted by key.
-    levels: Vec<Vec<Arc<SsTable>>>,
+    levels: Vec<Vec<Table>>,
+}
+
+/// A file the store holds, with what the manifest knows about it.
+#[derive(Debug, Clone)]
+struct Table {
+    meta: FileMeta,
+    table: Arc<SsTable>,
+}
+
+/// What the background thread does next.
+#[derive(Debug)]
+enum Task {
+    Flush(Frozen),
+    Compact,
+}
+
+impl State {
+    /// The open file with this number, if the store still holds it.
+    fn find(&self, number: u64) -> Option<Arc<SsTable>> {
+        self.levels
+            .iter()
+            .flatten()
+            .find(|table| table.meta.number == number)
+            .map(|table| Arc::clone(&table.table))
+    }
+
+    /// Drops the files a compaction consumed.
+    fn remove(&mut self, numbers: &[u64]) {
+        for level in &mut self.levels {
+            level.retain(|table| !numbers.contains(&table.meta.number));
+        }
+    }
+
+    /// Adds the files a compaction produced, keeping the level sorted by key.
+    fn insert(&mut self, level: usize, tables: Vec<Table>) {
+        while self.levels.len() <= level {
+            self.levels.push(Vec::new());
+        }
+        self.levels[level].extend(tables);
+        self.levels[level].sort_by(|left, right| left.meta.min_key.cmp(&right.meta.min_key));
+    }
+}
+
+/// The file of a level that could hold `key`, found by binary search since the
+/// files of a level below zero never overlap.
+fn covering<'a>(level: &'a [Table], key: &[u8]) -> Option<&'a Table> {
+    let found = level.binary_search_by(|table| {
+        if table.meta.max_key.as_slice() < key {
+            CmpOrdering::Less
+        } else if table.meta.min_key.as_slice() > key {
+            CmpOrdering::Greater
+        } else {
+            CmpOrdering::Equal
+        }
+    });
+    found.ok().and_then(|index| level.get(index))
 }
 
 /// A memtable waiting to become a file, and the logs that still hold it.
@@ -209,7 +285,9 @@ impl Engine {
                 levels,
             }),
             next_number: AtomicU64::new(next_number),
-            flush_error: Mutex::new(None),
+            compacting: Mutex::new(()),
+            bytes_written: AtomicU64::new(0),
+            background_error: Mutex::new(None),
         });
         let flusher = Some(spawn_flusher(&shared));
 
@@ -237,11 +315,19 @@ impl Engine {
                 return Ok(answer);
             }
         }
-        for level in &state.levels {
-            for table in level {
-                if let ControlFlow::Break(answer) = answer(table.get(key)?) {
-                    return Ok(answer);
-                }
+        // Level 0 files overlap, so every one of them may hold the key.
+        for table in state.levels.first().into_iter().flatten() {
+            if let ControlFlow::Break(answer) = answer(table.table.get(key)?) {
+                return Ok(answer);
+            }
+        }
+        // Deeper levels do not overlap, so at most one file per level can.
+        for level in state.levels.iter().skip(1) {
+            let Some(table) = covering(level, key) else {
+                continue;
+            };
+            if let ControlFlow::Break(answer) = answer(table.table.get(key)?) {
+                return Ok(answer);
             }
         }
         Ok(None)
@@ -307,6 +393,22 @@ impl Engine {
     pub fn flush(&self) -> Result<()> {
         self.shared.rotate(0)?;
         self.shared.wait_for_flush()
+    }
+
+    /// Compacts until no level is over its limit, on the calling thread.
+    ///
+    /// The background thread does this on its own; this is for a caller that
+    /// wants the store settled before it looks at it.
+    ///
+    /// # Errors
+    ///
+    /// Whatever a compaction failed with.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a previous writer panicked while holding the store.
+    pub fn compact(&self) -> Result<()> {
+        self.shared.compact_all()
     }
 
     /// Waits until every frozen memtable is on disk.
@@ -380,8 +482,17 @@ impl Engine {
             .levels
             .iter()
             .flatten()
-            .map(|table| table.block_reads())
+            .map(|table| table.table.block_reads())
             .sum()
+    }
+
+    /// Bytes written into files since the store was opened, by flushes and
+    /// compactions together.
+    ///
+    /// Divided by the bytes handed to [`Engine::set`], this is the write
+    /// amplification the level shape costs.
+    pub fn bytes_written(&self) -> u64 {
+        self.shared.bytes_written.load(Ordering::Relaxed)
     }
 
     /// Directory the store lives in.
@@ -408,7 +519,7 @@ impl Drop for Engine {
 
 impl Shared {
     fn write(&self, key: &[u8], value: Option<&[u8]>) -> Result<()> {
-        if let Some(err) = self.take_flush_error() {
+        if let Some(err) = self.take_background_error() {
             return Err(err);
         }
 
@@ -471,29 +582,36 @@ impl Shared {
         Ok(())
     }
 
-    /// The oldest frozen memtable, waiting for one to appear.
+    /// What to do next, waiting until there is something.
     ///
-    /// `retry` spaces out the attempts after a failure instead of spinning on
-    /// the same table.
-    fn next_flush(&self, retry: bool) -> Option<Frozen> {
+    /// Flushes come first: they free memory and hold up writes, while a
+    /// compaction only makes reads cheaper. `retry` spaces out the attempts
+    /// after a failure instead of spinning on the same work.
+    fn next_task(&self, retry: bool) -> Option<Task> {
         let mut queue = self.queue.lock().expect(POISONED);
         loop {
             if queue.shutdown {
                 return None;
             }
-            if queue.pending > 0 {
-                if retry {
-                    let (guard, _) = self
-                        .progress
-                        .wait_timeout(queue, RETRY_DELAY)
-                        .expect(POISONED);
-                    queue = guard;
-                    if queue.shutdown {
-                        return None;
-                    }
+            if retry {
+                let (guard, _) = self
+                    .progress
+                    .wait_timeout(queue, RETRY_DELAY)
+                    .expect(POISONED);
+                queue = guard;
+                if queue.shutdown {
+                    return None;
                 }
+            }
+            if queue.pending > 0 {
                 let state = self.state.read().expect(POISONED);
-                return state.frozen.last().cloned();
+                if let Some(frozen) = state.frozen.last() {
+                    return Some(Task::Flush(frozen.clone()));
+                }
+            }
+            if queue.shape_changed {
+                queue.shape_changed = false;
+                return Some(Task::Compact);
             }
             queue = self.progress.wait(queue).expect(POISONED);
         }
@@ -502,9 +620,7 @@ impl Shared {
     fn flush(&self, frozen: &Frozen) -> Result<()> {
         let number = self.next_number.fetch_add(1, Ordering::Relaxed);
         let table_path = self.dir.join(file_name(number, TABLE_EXT));
-        let partial_path = self
-            .dir
-            .join(format!("{}.{PARTIAL_EXT}", file_name(number, TABLE_EXT)));
+        let partial_path = self.partial_path(number);
 
         let mut writer = Writer::create(&partial_path)?;
         frozen
@@ -519,9 +635,12 @@ impl Shared {
         // The directory entry has to be durable before the manifest names it.
         sync_dir(&self.dir)?;
         let table = Arc::new(SsTable::open(&table_path)?);
+        self.bytes_written
+            .fetch_add(table.size_bytes(), Ordering::Relaxed);
 
         // Writing the manifest is what makes the table part of the store.
-        self.commit(&[meta_of(number, 0, &table)], &[], |state| {
+        let meta = meta_of(number, 0, &table);
+        self.commit(std::slice::from_ref(&meta), &[], |state| {
             debug_assert!(
                 state
                     .frozen
@@ -530,7 +649,13 @@ impl Shared {
                 "the flusher publishes the table it was handed"
             );
             // Newer than every file, older than everything still in memory.
-            state.levels[0].insert(0, table);
+            state.levels[0].insert(
+                0,
+                Table {
+                    meta: meta.clone(),
+                    table,
+                },
+            );
             state.frozen.pop();
         })?;
 
@@ -547,8 +672,138 @@ impl Shared {
     fn mark_progress(&self) {
         let mut queue = self.queue.lock().expect(POISONED);
         queue.pending = self.state.read().expect(POISONED).frozen.len();
+        // A new file changes the shape of the levels, so a compaction may now be
+        // due.
+        queue.shape_changed = true;
         drop(queue);
         self.progress.notify_all();
+    }
+
+    /// Compacts until nothing is over its limit.
+    fn compact_all(&self) -> Result<()> {
+        while self.compact_once()? {}
+        Ok(())
+    }
+
+    /// Runs one compaction, and reports whether there was one to run.
+    fn compact_once(&self) -> Result<bool> {
+        // Only one compaction at a time, so two of them never pick the same
+        // files. Flushes are unaffected: they only add at level 0.
+        let _serialized = self.compacting.lock().expect(POISONED);
+
+        let snapshot = self.durable.lock().expect(POISONED).snapshot.clone();
+        let Some(plan) = compaction::plan(
+            &snapshot,
+            self.config.l0_trigger,
+            self.level_bytes(),
+            self.config.fanout,
+        ) else {
+            return Ok(false);
+        };
+
+        let inputs: Vec<Arc<SsTable>> = {
+            let state = self.state.read().expect(POISONED);
+            plan.inputs
+                .iter()
+                .filter_map(|meta| state.find(meta.number))
+                .collect()
+        };
+        if inputs.len() != plan.inputs.len() {
+            // The shape moved under the plan; the next round replans from what
+            // the store actually holds.
+            return Ok(false);
+        }
+
+        let outputs = self.write_merged(&plan, &snapshot, &inputs)?;
+        // Every output has to be on the device before the manifest names it.
+        sync_dir(&self.dir)?;
+
+        let added: Vec<FileMeta> = outputs.iter().map(|table| table.meta.clone()).collect();
+        let removed = plan.input_numbers();
+        self.commit(&added, &removed, |state| {
+            state.remove(&removed);
+            state.insert(plan.output_level(), outputs);
+        })?;
+
+        drop(inputs);
+        for number in &removed {
+            let path = self.dir.join(file_name(*number, TABLE_EXT));
+            fs::remove_file(&path).map_err(|err| Error::io(&path, err))?;
+        }
+        self.mark_progress();
+        Ok(true)
+    }
+
+    /// Merges the plan's inputs into files of bounded size at the level below.
+    fn write_merged(
+        &self,
+        plan: &compaction::Plan,
+        snapshot: &Snapshot,
+        inputs: &[Arc<SsTable>],
+    ) -> Result<Vec<Table>> {
+        let output_level = plan.output_level();
+        let target = self.target_bytes();
+        let mut outputs = Vec::new();
+        let mut open: Option<(u64, PathBuf, Writer)> = None;
+
+        for entry in Merge::new(inputs.iter().map(|table| table.scan()).collect()) {
+            let entry = entry?;
+            // A tombstone that shadows nothing left below is dead weight, and
+            // dropping it is the only way the space is ever given back.
+            if entry.value.is_none()
+                && !compaction::tombstone_needed(snapshot, output_level, &entry.key)
+            {
+                continue;
+            }
+
+            if open.is_none() {
+                let number = self.next_number.fetch_add(1, Ordering::Relaxed);
+                let partial = self.partial_path(number);
+                let writer = Writer::create(&partial)?;
+                open = Some((number, partial, writer));
+            }
+            let (_, _, writer) = open.as_mut().expect("just opened");
+            writer.add(&entry.key, entry.seq, entry.value.as_deref())?;
+
+            if writer.bytes_written() >= target {
+                let (number, partial, writer) = open.take().expect("just written to");
+                outputs.push(self.seal(number, output_level, &partial, writer)?);
+            }
+        }
+
+        if let Some((number, partial, writer)) = open.take() {
+            outputs.push(self.seal(number, output_level, &partial, writer)?);
+        }
+        Ok(outputs)
+    }
+
+    /// Closes an output file and opens it back for reading.
+    fn seal(&self, number: u64, level: usize, partial: &Path, writer: Writer) -> Result<Table> {
+        writer.finish()?;
+        let path = self.dir.join(file_name(number, TABLE_EXT));
+        fs::rename(partial, &path).map_err(|err| Error::io(&path, err))?;
+        let table = Arc::new(SsTable::open(&path)?);
+        self.bytes_written
+            .fetch_add(table.size_bytes(), Ordering::Relaxed);
+        Ok(Table {
+            meta: meta_of(number, level, &table),
+            table,
+        })
+    }
+
+    fn partial_path(&self, number: u64) -> PathBuf {
+        self.dir
+            .join(format!("{}.{PARTIAL_EXT}", file_name(number, TABLE_EXT)))
+    }
+
+    /// Byte budget of level 1. Deeper levels are `fanout` times bigger.
+    fn level_bytes(&self) -> u64 {
+        self.target_bytes().saturating_mul(self.config.fanout)
+    }
+
+    /// Size a compaction cuts its output files at.
+    fn target_bytes(&self) -> u64 {
+        u64::try_from(self.config.memtable_bytes).unwrap_or(u64::MAX)
     }
 
     /// Records a change to the file set, then publishes it in memory.
@@ -581,7 +836,7 @@ impl Shared {
     fn wait_for_flush(&self) -> Result<()> {
         let mut queue = self.queue.lock().expect(POISONED);
         loop {
-            if let Some(err) = self.take_flush_error() {
+            if let Some(err) = self.take_background_error() {
                 return Err(err);
             }
             if queue.pending == 0 {
@@ -591,16 +846,16 @@ impl Shared {
         }
     }
 
-    fn take_flush_error(&self) -> Option<Error> {
-        self.flush_error
+    fn take_background_error(&self) -> Option<Error> {
+        self.background_error
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take()
     }
 
-    fn set_flush_error(&self, err: Error) {
+    fn set_background_error(&self, err: Error) {
         let mut slot = self
-            .flush_error
+            .background_error
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         if slot.is_none() {
@@ -618,11 +873,15 @@ fn spawn_flusher(shared: &Arc<Shared>) -> JoinHandle<()> {
         .name("lsmkv-flush".to_owned())
         .spawn(move || {
             let mut retry = false;
-            while let Some(frozen) = shared.next_flush(retry) {
-                retry = match shared.flush(&frozen) {
+            while let Some(task) = shared.next_task(retry) {
+                let outcome = match task {
+                    Task::Flush(frozen) => shared.flush(&frozen),
+                    Task::Compact => shared.compact_all(),
+                };
+                retry = match outcome {
                     Ok(()) => false,
                     Err(err) => {
-                        shared.set_flush_error(err);
+                        shared.set_background_error(err);
                         true
                     }
                 };
@@ -651,21 +910,21 @@ fn apply(memtable: &Memtable, record: Record) -> u64 {
 }
 
 /// Opens every file the snapshot names, sorted the way each level wants.
-fn open_levels(dir: &Path, snapshot: &Snapshot) -> Result<Vec<Vec<Arc<SsTable>>>> {
-    let mut levels = vec![Vec::new(); snapshot.deepest_level() + 1];
+fn open_levels(dir: &Path, snapshot: &Snapshot) -> Result<Vec<Vec<Table>>> {
+    let mut levels: Vec<Vec<Table>> = vec![Vec::new(); snapshot.deepest_level() + 1];
     let mut files = snapshot.files.clone();
     files.sort_unstable_by_key(|file| file.number);
 
-    for file in &files {
-        let table = Arc::new(SsTable::open(dir.join(file_name(file.number, TABLE_EXT)))?);
-        levels[file.level].push(table);
+    for meta in files {
+        let table = Arc::new(SsTable::open(dir.join(file_name(meta.number, TABLE_EXT)))?);
+        levels[meta.level].push(Table { meta, table });
     }
 
     // Level 0 files overlap, so a lookup consults them newest first. Deeper
     // levels do not overlap, and key order is what a search there follows.
     levels[0].reverse();
     for level in levels.iter_mut().skip(1) {
-        level.sort_by(|left, right| left.min_key().cmp(right.min_key()));
+        level.sort_by(|left, right| left.meta.min_key.cmp(&right.meta.min_key));
     }
     Ok(levels)
 }
@@ -752,6 +1011,7 @@ mod tests {
         Config {
             sync: SyncPolicy::Group,
             memtable_bytes,
+            ..Config::default()
         }
     }
 
@@ -1026,10 +1286,206 @@ mod tests {
                     .expect("set");
             }
             engine.wait_for_flush().expect("wait");
-            assert!(engine.table_count() > 1, "the writes must have flushed");
+            assert!(
+                engine.table_count() > 0,
+                "the writes must have reached a file"
+            );
         }
 
         let engine = open(&dir, 512);
+        for i in 0..KEYS {
+            let key = format!("key:{i:04}");
+            assert_eq!(
+                value(&engine, key.as_bytes()),
+                Some(format!("value:{i}").into_bytes()),
+                "key {i}"
+            );
+        }
+    }
+
+    /// Levels small enough that a few hundred keys reach level 2 and beyond.
+    fn layered(dir: &TempDir) -> Engine {
+        Engine::open(
+            dir.join("store"),
+            Config {
+                sync: SyncPolicy::Group,
+                memtable_bytes: 256,
+                l0_trigger: 2,
+                fanout: 2,
+            },
+        )
+        .expect("open")
+    }
+
+    fn snapshot_of(engine: &Engine) -> crate::manifest::Snapshot {
+        Manifest::new(engine.dir())
+            .load()
+            .expect("load")
+            .expect("a store with files has a manifest")
+    }
+
+    #[test]
+    fn level_zero_is_drained_into_the_levels_below() {
+        let dir = TempDir::new();
+        let engine = layered(&dir);
+
+        for i in 0..40 {
+            let key = format!("key:{i:04}");
+            engine.set(key.as_bytes(), b"value").expect("set");
+        }
+        engine.flush().expect("flush");
+        engine.compact().expect("compact");
+
+        // With budgets this small the output keeps falling until it fits, which
+        // is the leveled behaviour: level 0 is emptied, the data lives below.
+        let levels = engine.level_sizes();
+        assert_eq!(levels[0], 0, "level 0 was drained, got {levels:?}");
+        assert!(
+            levels.iter().skip(1).sum::<usize>() > 0,
+            "the data has to be somewhere: {levels:?}"
+        );
+        for i in 0..40 {
+            let key = format!("key:{i:04}");
+            assert_eq!(value(&engine, key.as_bytes()), Some(b"value".to_vec()));
+        }
+    }
+
+    #[test]
+    fn files_below_level_zero_never_overlap() {
+        let dir = TempDir::new();
+        let engine = layered(&dir);
+        for i in 0..300 {
+            let key = format!("key:{i:04}");
+            engine.set(key.as_bytes(), b"value").expect("set");
+        }
+        engine.flush().expect("flush");
+        engine.compact().expect("compact");
+
+        let snapshot = snapshot_of(&engine);
+        for level in 1..=snapshot.deepest_level() {
+            let mut files: Vec<_> = snapshot.at_level(level).collect();
+            files.sort_by(|left, right| left.min_key.cmp(&right.min_key));
+            for pair in files.windows(2) {
+                assert!(
+                    pair[0].max_key < pair[1].min_key,
+                    "level {level} files overlap: {:?} and {:?}",
+                    pair[0],
+                    pair[1]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_key_deleted_above_a_deep_level_does_not_come_back() {
+        let dir = TempDir::new();
+        let engine = layered(&dir);
+
+        for i in 0..300 {
+            let key = format!("key:{i:04}");
+            engine.set(key.as_bytes(), b"value").expect("set");
+        }
+        engine.flush().expect("flush");
+        engine.compact().expect("compact");
+        assert!(
+            engine.level_sizes().len() > 2,
+            "the value has to sit deeper than the level the tombstone lands in"
+        );
+
+        engine.delete(b"key:0150").expect("delete");
+        engine.flush().expect("flush");
+        engine.compact().expect("compact");
+
+        // Dropping that tombstone while a deeper level still holds the value is
+        // exactly how a deleted key comes back from the dead.
+        assert_eq!(value(&engine, b"key:0150"), None);
+        drop(engine);
+
+        let engine = layered(&dir);
+        assert_eq!(value(&engine, b"key:0150"), None);
+        assert_eq!(value(&engine, b"key:0149"), Some(b"value".to_vec()));
+    }
+
+    #[test]
+    fn compaction_drops_the_versions_a_key_no_longer_needs() {
+        const KEYS: u64 = 200;
+
+        let dir = TempDir::new();
+        let engine = layered(&dir);
+
+        for round in 0..3 {
+            for i in 0..KEYS {
+                let key = format!("key:{i:04}");
+                let value = format!("round:{round}");
+                engine.set(key.as_bytes(), value.as_bytes()).expect("set");
+            }
+        }
+        engine.flush().expect("flush");
+        engine.compact().expect("compact");
+
+        let entries: u64 = snapshot_of(&engine)
+            .files
+            .iter()
+            .map(|file| file.entries)
+            .sum();
+        assert!(
+            entries < KEYS * 3,
+            "three rounds of writes left {entries} entries for {KEYS} keys"
+        );
+        for i in 0..KEYS {
+            let key = format!("key:{i:04}");
+            assert_eq!(
+                value(&engine, key.as_bytes()),
+                Some(b"round:2".to_vec()),
+                "key {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_compacted_store_holds_only_the_files_the_manifest_names() {
+        let dir = TempDir::new();
+        let engine = layered(&dir);
+        for i in 0..200 {
+            let key = format!("key:{i:04}");
+            engine.set(key.as_bytes(), b"value").expect("set");
+        }
+        engine.flush().expect("flush");
+        engine.compact().expect("compact");
+
+        let named: Vec<u64> = snapshot_of(&engine)
+            .files
+            .iter()
+            .map(|file| file.number)
+            .collect();
+        let on_disk = count_files(&engine, TABLE_EXT);
+
+        assert_eq!(
+            on_disk,
+            named.len(),
+            "the inputs of every compaction have to be gone"
+        );
+        assert_eq!(engine.table_count(), named.len());
+    }
+
+    #[test]
+    fn every_key_survives_compaction_and_a_reopen() {
+        const KEYS: usize = 400;
+
+        let dir = TempDir::new();
+        {
+            let engine = layered(&dir);
+            for i in 0..KEYS {
+                let key = format!("key:{i:04}");
+                engine
+                    .set(key.as_bytes(), format!("value:{i}").as_bytes())
+                    .expect("set");
+            }
+            engine.flush().expect("flush");
+            engine.compact().expect("compact");
+        }
+
+        let engine = layered(&dir);
         for i in 0..KEYS {
             let key = format!("key:{i:04}");
             assert_eq!(
@@ -1072,7 +1528,10 @@ mod tests {
         let keys: Vec<String> = (0..KEYS).map(|i| format!("key:{i}")).collect();
         let in_memory: Vec<Option<Vec<u8>>> =
             keys.iter().map(|k| value(&engine, k.as_bytes())).collect();
-        assert!(engine.table_count() > 1, "the writes must have flushed");
+        assert!(
+            engine.table_count() > 0,
+            "the writes must have reached a file"
+        );
         drop(engine);
 
         let engine = open(&dir, 256);

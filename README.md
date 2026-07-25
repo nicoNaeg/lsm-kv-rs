@@ -149,6 +149,41 @@ The same run then measures the store itself. It writes 6000 keys in a scattered 
 
 When keys do arrive in order the files partition the key space, and the key range in the footer already rejects them for free. The filter is what covers the case where they do not.
 
+## Compaction
+
+Level 0 holds whatever the flushes produced, so its files overlap and each one costs a lookup: what matters there is how many there are, and four is the trigger. Deeper levels hold files that never overlap, so a lookup consults at most one file per level whatever their number: what matters there is how many bytes the level holds against its budget, which is ten times the budget of the level above. A score per level, how far past its own limit it sits, picks the neediest one, which is how RocksDB chooses.
+
+A compaction merges every file of level 0, or the oldest file of a deeper level, with every file of the level below whose key range it touches. It is a streaming k-way merge, so it holds one block of each input rather than any whole file, and where several inputs carry the same key the highest sequence number wins. The output is cut into files of the memtable size and cannot overlap, since it comes out of a single sorted stream.
+
+### The manifest
+
+The set of live files is recorded in a manifest: the whole state, rewritten into a temporary file and renamed into place. That rename is the commit point of a flush or a compaction. A table the manifest does not name is an orphan a crash left behind, and opening the store deletes it, with the log that fed it still there to replay. A store holding tables with no manifest is refused rather than guessed at: guessing the level and the recency of a file wrong resurrects stale values.
+
+An append-only log of edits, as LevelDB uses, is the alternative. The state here is a few tens of bytes per file, so rewriting it whole costs less than the machinery to replay a log and compact that log in turn, and an atomic rename is a sturdier primitive than the tail of a log.
+
+The manifest also carries the sequence counter, so numbering survives a store whose logs have all been flushed away, and the file numbering, so a crashed compaction cannot hand out a number twice.
+
+### When a tombstone can go
+
+A tombstone is dropped only when no file below the output level could still hold the key, which the manifest answers from the key ranges it already records. Drop one too early and the deleted value comes back from the dead. The test that pins it down is `a_key_deleted_above_a_deep_level_does_not_come_back`: a value pushed down to level 2, then deleted, then its tombstone compacted from level 0 into level 1, where dropping it would uncover the value again.
+
+### What it costs and what it buys
+
+Two stores, same keys, each key written twice so half the data on disk is obsolete. One has its level 0 trigger set out of reach, so nothing is ever compacted; the other is left alone.
+
+    cargo run --release --example compaction
+
+| shape | files per level | on disk | write amplification | space amplification | mean lookup | blocks read for 20 000 absent keys |
+|-------|-----------------|---------|---------------------|---------------------|-------------|------------------------------------|
+| flushes only | [68] | 5052 KiB | 1.18 | 2.35 | 10.78 µs | 11079 |
+| leveled | [0, 9, 29] | 2525 KiB | 3.61 | 1.18 | 8.89 µs | 166 |
+
+Compaction halves the disk footprint, because the obsolete version of every key is gone, and cuts the block reads an absent key costs by 67 times. The flat store's 11079 is what the theory predicts: 68 overlapping files, 20 000 lookups, 0.82 % false positives each, so 11152 expected. The leveled store consults at most one file per level, so its filters have far less to reject.
+
+The price is 3.61 bytes written per byte ingested, against 1.18. That figure grows with the number of level transitions the data crosses, two here; a store deep enough for four would pay roughly twice as much. This is the write amplification a leveled shape is known for, and the reason the choice was argued from our own profile: writes here are limited by the device flush of the log, at 260 to 1036 per second, not by background bandwidth.
+
+Two details worth naming. The 1.18 of the flushes-only store is not 1.00 because every file carries its index, its filter and its framing on top of the entries. And the mean lookup moves far less than the block reads do, because a key that is present is found in one block read either way: what the flat shape wastes is Bloom probes and page cache, not the read that answers.
+
 ## Build order
 
 Each stage lands with its tests before the next one starts.
@@ -157,12 +192,12 @@ Each stage lands with its tests before the next one starts.
 2. **Memtable and engine API** (built): sorted in-memory table, `get`, `set` and `delete` with tombstones, backed by the WAL and ordered by its sequence numbers.
 3. **Sorted files** (built): writer and reader, 4 KiB blocks, sparse index and footer, log rotation and background flush of a full memtable.
 4. **Bloom filters** (built): one per file, so a lookup skips a file that cannot hold the key without touching the disk.
-5. **Compaction**: background merge, tombstone purge, manifest describing the live set of files.
+5. **Compaction** (built): manifest, leveled background merge, tombstone purge.
 6. **Server**: RESP2 subset on tokio, so redis-cli and redis-benchmark drive the engine unchanged.
 7. **Benchmarks and profiling**: criterion micro-benchmarks, redis-benchmark end to end, flamegraph of the hot path.
 8. **Skiplist memtable**: hand-written concurrent skiplist measured against the BTreeMap baseline. The memtable interface is extracted then, from two implementations rather than from one.
 
-Current stage: 5.
+Current stage: 6.
 
 ## Benchmarking
 

@@ -67,6 +67,7 @@ fn store_lookups() {
             // The durability policy is not what is being measured here.
             sync: SyncPolicy::Interval(std::time::Duration::from_millis(10)),
             memtable_bytes: MEMTABLE_BYTES,
+            ..Config::default()
         },
     )
     .expect("open the store");

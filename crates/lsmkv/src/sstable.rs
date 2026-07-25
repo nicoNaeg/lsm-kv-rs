@@ -207,6 +207,11 @@ impl Writer {
         file.sync_all().map_err(|err| Error::io(&self.path, err))
     }
 
+    /// Bytes written so far, which is what a compaction cuts its output on.
+    pub fn bytes_written(&self) -> u64 {
+        self.offset
+    }
+
     fn close_block(&mut self) -> Result<()> {
         if self.block.is_empty() {
             return Ok(());
@@ -235,6 +240,71 @@ impl Writer {
             .map_err(|err| Error::io(&self.path, err))?;
         self.offset += bytes.len() as u64;
         Ok(())
+    }
+}
+
+/// One entry as a file holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    /// The key.
+    pub key: Vec<u8>,
+    /// Sequence number of the mutation that produced it.
+    pub seq: u64,
+    /// `None` is a tombstone.
+    pub value: Option<Vec<u8>>,
+}
+
+/// Every entry of a file, in key order, one block at a time.
+///
+/// Compaction reads files this way, so a merge never holds more than one block
+/// of each input in memory.
+#[derive(Debug)]
+pub struct Scan<'a> {
+    table: &'a SsTable,
+    next_block: usize,
+    buffer: Vec<u8>,
+    offset: usize,
+    failed: bool,
+}
+
+impl Iterator for Scan<'_> {
+    type Item = Result<Entry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed {
+            return None;
+        }
+        loop {
+            if self.offset < self.buffer.len() {
+                let mut cursor = &self.buffer[self.offset..];
+                let Some(record) = take_record(&mut cursor) else {
+                    self.failed = true;
+                    return Some(Err(Error::corrupt(
+                        &self.table.path,
+                        "block is not readable",
+                    )));
+                };
+                self.offset = self.buffer.len() - cursor.len();
+                return Some(Ok(Entry {
+                    key: record.key.to_vec(),
+                    seq: record.seq,
+                    value: record.value.map(<[u8]>::to_vec),
+                }));
+            }
+
+            let block = self.table.blocks.get(self.next_block)?;
+            self.next_block += 1;
+            match read_checked(&self.table.file, &self.table.path, block.offset, block.len) {
+                Ok(bytes) => {
+                    self.buffer = bytes;
+                    self.offset = 0;
+                }
+                Err(err) => {
+                    self.failed = true;
+                    return Some(Err(err));
+                }
+            }
+        }
     }
 }
 
@@ -376,8 +446,19 @@ impl SsTable {
         self.blocks.len()
     }
 
-    /// Blocks read from the device since the file was opened. A lookup the
-    /// filter rejects adds nothing here.
+    /// Every entry in key order.
+    pub fn scan(&self) -> Scan<'_> {
+        Scan {
+            table: self,
+            next_block: 0,
+            buffer: Vec::new(),
+            offset: 0,
+            failed: false,
+        }
+    }
+
+    /// Blocks read to answer lookups since the file was opened. A lookup the
+    /// filter rejects adds nothing here, and a scan is not counted.
     pub fn block_reads(&self) -> u64 {
         self.block_reads.load(Ordering::Relaxed)
     }
@@ -428,22 +509,40 @@ fn parse_index(cursor: &mut &[u8]) -> Option<(Vec<u8>, Vec<u8>, Vec<BlockRef>)> 
     Some((min_key, max_key, blocks))
 }
 
+/// One record as it sits in a block.
+struct RecordRef<'a> {
+    seq: u64,
+    key: &'a [u8],
+    /// `None` is a tombstone.
+    value: Option<&'a [u8]>,
+}
+
+/// Takes one record off the front of a block.
+fn take_record<'a>(cursor: &mut &'a [u8]) -> Option<RecordRef<'a>> {
+    let seq = take_u64(cursor)?;
+    let kind = take_u8(cursor)?;
+    let key = take_field(cursor)?;
+    let value = match kind {
+        KIND_SET => Some(take_field(cursor)?),
+        KIND_DELETE => None,
+        _ => return None,
+    };
+    Some(RecordRef { seq, key, value })
+}
+
 /// Walks a block for `key`. Returns `None` if the block is malformed.
 fn scan_block(mut cursor: &[u8], key: &[u8]) -> Option<Lookup> {
     while !cursor.is_empty() {
-        let _seq = take_u64(&mut cursor)?;
-        let kind = take_u8(&mut cursor)?;
-        let found = take_field(&mut cursor)?;
-        let value = match kind {
-            KIND_SET => Some(take_field(&mut cursor)?),
-            KIND_DELETE => None,
-            _ => return None,
-        };
+        let record = take_record(&mut cursor)?;
 
-        match found.cmp(key) {
+        match record.key.cmp(key) {
             std::cmp::Ordering::Less => {}
             std::cmp::Ordering::Equal => {
-                return Some(value.map_or(Lookup::Deleted, |value| Lookup::Found(value.to_vec())));
+                return Some(
+                    record
+                        .value
+                        .map_or(Lookup::Deleted, |value| Lookup::Found(value.to_vec())),
+                );
             }
             // Records are sorted, so nothing further down can match.
             std::cmp::Ordering::Greater => return Some(Lookup::Missing),
@@ -566,6 +665,51 @@ mod tests {
         let table = SsTable::open(&path).expect("open");
         assert_eq!(table.block_count(), 2);
         assert_eq!(table.get(b"a").expect("get"), Lookup::Found(big));
+    }
+
+    #[test]
+    fn a_scan_walks_every_entry_in_key_order() {
+        let dir = TempDir::new();
+        let table = write_table(&dir.join("t.sst"), 500);
+
+        let entries: Vec<Entry> = table.scan().map(|entry| entry.expect("entry")).collect();
+
+        assert_eq!(entries.len(), 500);
+        for (i, entry) in entries.iter().enumerate() {
+            assert_eq!(entry.key, format!("key:{i:06}").into_bytes());
+            assert_eq!(entry.seq, i as u64 + 1);
+            if i % 7 == 0 {
+                assert_eq!(entry.value, None, "entry {i} is a tombstone");
+            } else {
+                assert_eq!(entry.value, Some(format!("value:{i}").into_bytes()));
+            }
+        }
+    }
+
+    #[test]
+    fn a_scan_of_a_single_entry_file_yields_it() {
+        let dir = TempDir::new();
+        let table = write_table(&dir.join("t.sst"), 1);
+
+        assert_eq!(table.scan().count(), 1);
+    }
+
+    #[test]
+    fn a_scan_reports_a_corrupted_block() {
+        let dir = TempDir::new();
+        let path = dir.join("t.sst");
+        write_table(&path, 200);
+
+        let mut bytes = fs::read(&path).expect("read");
+        bytes[64] ^= 0b0010_0000;
+        fs::write(&path, &bytes).expect("write");
+
+        let table = SsTable::open(&path).expect("open");
+        let outcome: Vec<Result<Entry>> = table.scan().collect();
+        assert!(
+            outcome.iter().any(std::result::Result::is_err),
+            "a scan must surface the corruption rather than skip it"
+        );
     }
 
     #[test]
