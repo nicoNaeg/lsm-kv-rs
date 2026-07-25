@@ -2,7 +2,7 @@
 
 > LSM-tree key-value storage engine in Rust, served over the Redis wire protocol. Write-ahead log, sorted memtable, immutable SSTables with sparse index and Bloom filters, background compaction.
 
-**Status: in progress.** The engine is built in the stages listed under [Build order](#build-order), and this README says plainly which ones exist. Performance numbers appear as each stage becomes measurable, always with the command that reproduces them and the machine they ran on.
+**Status: complete through the eight stages under [Build order](#build-order).** Every performance number below comes with the command that reproduces it and the machine it ran on, and the ones that came out against the design are here too: a lock-free memtable that wins its micro-benchmark by 34x and moves nothing end to end is as much of a result as the optimizations that worked.
 
 ## Design
 
@@ -70,8 +70,9 @@ Adding writers does nothing for `Always` (261 against 259 appends/s) because eve
 
 The `writes` column above is the result of the one optimization stage 7 was pointed at, and it is worth showing where the pointer came from. Stage 1 measured `Interval` as *slower* with eight writers than with one, 243k against 565k appends per second: once the device is out of the way, what remains is one `write` syscall per record taken under one append lock. Stage 6 put a second number on the same thing, 192 864 pipelined writes per second over TCP, which is 192 864 syscalls per second.
 
-The profile is where the intuition got corrected.
+The profile is where the intuition got corrected. Both profiles below come from the same command, run on either side of the change, since running it today can only show the state today:
 
+    git checkout 3129f4f   # the commit before this one
     ./scripts/flamegraph-server.sh docs/flamegraph-write-path-before.svg
 
 [The flamegraph before the change](docs/flamegraph-write-path-before.svg), same load, does not say what those two numbers suggest. The `write` syscall itself is 1.5 % of the samples. What holds 96.6 % of them is `__psynch_mutexwait` under `wal::Shared::append`: blocking-pool threads queued on the append lock, waiting for whichever one holds it to come back from its syscall.
@@ -80,7 +81,7 @@ That distinction is the reason to take a profile rather than reason about one. T
 
 That fix is the same shape as the group commit already there. An append encodes its record into a buffer shared by every writer and returns; whoever owns the next flush writes that whole buffer out in one syscall, then flushes it. A batch of concurrent appends costs one `write` and one `F_FULLFSYNC` rather than one of each per record. The buffer is capped at 64 KiB, so under `Interval`, where nothing else empties it between two background flushes, the window a crash can lose stays bounded in bytes as well as in time.
 
-[The flamegraph after](docs/flamegraph-write-path-after.svg) is the same load on the same machine: the append lock wait is down to 8.4 % of samples, and the largest remaining blocks are blocking-pool threads parked with nothing left to do. The two profiles are read as shares and not as counts, because a thread blocked on a lock is sampled exactly like a thread doing work, which is precisely what made the first one legible.
+[The flamegraph after](docs/flamegraph-write-path-after.svg) is the same command on the same machine, on this commit: the append lock wait is down to 8.4 % of samples, and the largest remaining blocks are blocking-pool threads parked with nothing left to do. The two profiles are read as shares and not as counts, because a thread blocked on a lock is sampled exactly like a thread doing work, which is precisely what made the first one legible.
 
 Same machine, same benchmark, same 1M cap, before and after:
 
@@ -155,14 +156,14 @@ The reads going the other way is the cost of the trade. A `BTreeMap` node holds 
 
 ### Why the 34x does not reach the server
 
-A structure that wins its micro-benchmark by 34x and changes nothing end to end is the more useful result of the two, so here is that measurement, from the same script that compares the server against Redis:
+A structure that wins its micro-benchmark by 34x and does not win end to end is the more useful result of the two, so here is that measurement, from the same script that compares the server against Redis:
 
     ./scripts/bench-server.sh
 
 | memtable | SET/s | GET/s | pipelined SET/s | pipelined GET/s |
 |----------|-------|-------|-----------------|-----------------|
-| BTreeMap | 96618 | 98522 | 696864 | 1612903 |
-| skiplist | 99009 | 100502 | 673400 | 869565 |
+| BTreeMap | 99502 | 101010 | 714285 | 1694915 |
+| skiplist | 96618 | 102040 | 651465 | 1136363 |
 
 Unpipelined the two are level, both near 100k, because neither is what limits that path: a request there costs a syscall, a wakeup and a hop onto the blocking pool, and the memtable operation is under a fraction of a percent of it. The 34x is real and it is spent on something that was never the bottleneck.
 
@@ -218,6 +219,7 @@ Those are the numbers after the section below, which is about where the 7.54 µs
 
 ### Where a warm read actually went
 
+    git checkout e71555a   # before the checksum change below
     ./scripts/flamegraph-server.sh docs/flamegraph-read-path-before.svg 5 read
 
 [The read path profile](docs/flamegraph-read-path-before.svg) runs `redis-benchmark -t get` against a store whose key space is several times its memtable, so the lookups reach the files rather than the table the keys were written to: 3.5 million blocks were read during the five seconds it samples. `SsTable::get` held 34.4 % of the samples, and `read_checked`, which reads one block and verifies it, held 33.5 % of them. Essentially all of a lookup was that one function.
@@ -250,7 +252,7 @@ The polynomial does not change, so the bytes on disk do not either: a file writt
 | one 4 KiB positional read | 323.8 ns | 325.9 ns | unchanged |
 | the same, allocating | 375.6 ns | 376.0 ns | unchanged |
 
-The two reads are the control: nothing but the checksum was touched, and they say so. In [the profile afterwards](docs/flamegraph-read-path-after.svg) `read_checked` falls from 33.5 % of samples to 3.7 %, while `scan_block` holds at 247 samples against 264, which is the same control seen the other way.
+The two reads are the control: nothing but the checksum was touched, and they say so. In [the profile afterwards](docs/flamegraph-read-path-after.svg), taken by the same command on this commit, `read_checked` falls from 33.5 % of samples to 3.7 % while `scan_block` holds at 247 samples against 264, which is the same control seen the other way.
 
 End to end, on reads that reach the files:
 
@@ -275,7 +277,7 @@ Three orderings carry the guarantee, each against a failure that would otherwise
 
 A lookup walks the active memtable, then the frozen ones, then the files from newest to oldest, and stops at the first level that answers. This is where the three-way answer earns its keep: a value and a tombstone both stop the search, and only "not here" continues to older levels. A key deleted after its value reached a file is exactly that, a tombstone in a newer level shadowing an older file.
 
-One limitation worth naming: sequence numbers restart at 1 once every log has been flushed away, because nothing on disk persists the counter. It costs nothing today, since the level a value sits in decides whether it wins rather than the number it carries. The manifest of stage 5 is where that counter gets written down.
+Sequence numbers used to restart at 1 once every log had been flushed away, because nothing on disk persisted the counter. The manifest carries it now, and `sequence_numbers_survive_a_store_whose_logs_are_all_flushed` is the test that keeps it that way: a fresh write must never look older than the record it replaces.
 
 ## Bloom filters
 
@@ -392,21 +394,21 @@ Apple M4 Pro, macOS 26.5, redis 8.8.1, `redis-benchmark -t set,get -n 20000 -c 5
 
 | server | durability of a write | SET/s | GET/s |
 |--------|-----------------------|-------|-------|
-| redis, default | none, memory only | 141843 | 157480 |
-| redis, appendfsync always | `fsync` per write | 6242 | 126582 |
-| lsm-kv-rs, interval 10 ms | log flushed every 10 ms | 99009 | 98522 |
-| lsm-kv-rs, group commit | device flush per write, shared | 6387 | 101522 |
-| lsm-kv-rs, flush per write | device flush per write, serialized | 255 | 100502 |
+| redis, default | none, memory only | 130718 | 156250 |
+| redis, appendfsync always | `fsync` per write | 6349 | 126582 |
+| lsm-kv-rs, interval 10 ms | log flushed every 10 ms | 99009 | 100502 |
+| lsm-kv-rs, group commit | device flush per write, shared | 6410 | 98039 |
+| lsm-kv-rs, flush per write | device flush per write, serialized | 256 | 100502 |
 
 Read honestly, that table says four things.
 
-Redis is 1.6 times faster on reads and 1.4 times on writes at its default settings, which is what a hash table in memory buys against a log, a memtable and a lookup that may reach a file.
+Redis is 1.6 times faster on reads and 1.3 times on writes at its default settings, which is what a hash table in memory buys against a log, a memtable and a lookup that may reach a file.
 
-The two rows to compare for durability are `appendfsync always` at 6242 and group commit at 6387, and they do not measure the same guarantee: Redis calls `fsync`, which on macOS may leave the write in the drive's own cache, while `sync_data` here issues `F_FULLFSYNC`, which drains it. Equal throughput for a strictly stronger promise, where before the log batching it was half.
+The two rows to compare for durability are `appendfsync always` at 6349 and group commit at 6410, and they do not measure the same guarantee: Redis calls `fsync`, which on macOS may leave the write in the drive's own cache, while `sync_data` here issues `F_FULLFSYNC`, which drains it. Equal throughput for a strictly stronger promise, where before the log batching it was half.
 
-The 255 writes per second of the serialized policy is the 260 the log benchmark measures on its own. The network layer adds nothing measurable, because a 3.8 ms device flush dominates everything else in the path.
+The 256 writes per second of the serialized policy is the 260 the log benchmark measures on its own. The network layer adds nothing measurable, because a 3.8 ms device flush dominates everything else in the path.
 
-And group commit at 6387 writes per second means about 25 appends amortized per device flush with 50 clients, against 4.6 with eight writers in the log benchmark. The batching improves as clients arrive, which is what it is for.
+And group commit at 6410 writes per second means about 25 appends amortized per device flush with 50 clients, against 4.6 with eight writers in the log benchmark. The batching improves as clients arrive, which is what it is for.
 
 ### What pipelining exposes
 
@@ -414,12 +416,14 @@ And group commit at 6387 writes per second means about 25 appends amortized per 
 
 | server | SET/s | GET/s |
 |--------|-------|-------|
-| redis, default | 1587301 | 1960784 |
-| lsm-kv-rs, interval 10 ms | 1142857 | 1652892 |
+| redis, default | 1550387 | 2380952 |
+| lsm-kv-rs, interval 10 ms | 1219512 | 1550387 |
 
-On reads this lands within 16 % of Redis, 1.65 million against 1.96 million, which says the batch-per-hop design holds and the read path is not what needs work.
+One caveat before reading those, because it cuts against the flattering interpretation as often as the harsh one. Repeated three times, this store's pipelined GET lands at 1.50, 1.53 and 1.54 million, inside one percent. Redis's lands at 1.67, 1.92 and 1.92 million, and the 2.38 above is a fourth. So the gap on reads is somewhere between a tenth and a third depending on which run either side gets, and quoting a single figure for it would be picking one.
 
-Writes were the interesting number here before stage 7: 192 864 per second, an eight-fold gap, and the reason was one `write` syscall per record under one append lock. Batching those writes closed most of it. At 1.14 million against Redis's 1.59 million the store is within 28 % on writes it is still logging to disk, against a Redis that is not.
+What survives that spread is the shape: reads are in the same order as Redis's, which says the batch-per-hop design holds and the read path is not what needs work.
+
+Writes were the interesting number here before stage 7: 192 864 per second, an eight-fold gap, and the reason was one `write` syscall per record under one append lock. Batching those writes closed most of it. At 1.22 million against Redis's 1.55 million the store is within a quarter on writes it is still logging to disk, against a Redis that is not.
 
 ## Build order
 
@@ -436,6 +440,18 @@ Each stage lands with its tests before the next one starts.
 
 All eight stages are built.
 
+## Known limits
+
+Each of these is measured rather than suspected, and each is here because the measurement did not justify the fix yet.
+
+**The skiplist arena cannot grow.** It is sized from the memtable budget at an assumed 96 bytes per entry, so entries much smaller than that exhaust it before the byte budget is reached and the table is frozen early. Measured at a fifth of the budget on 20 byte entries. Growing it in chunks needs either a lock on the chunk list or the raw pointers the structure exists to avoid, and there is no workload here where the skiplist is ahead end to end to pay for that.
+
+**`CRC-32C` would be faster than slice-by-eight.** The ARM64 `crc32c` instruction consumes 8 bytes per instruction against 8 bytes per eight lookups. It is a different polynomial, so it is an SSTable format version bump, and the intrinsic needs `unsafe` against a lint this workspace denies everywhere. Both costs were worth paying when the checksum was 94 % of a read; at 3.7 % of the profile it is no longer the thing to attack.
+
+**The log still serializes on one append lock.** Batching took the `write` syscall out of that critical section, which is what made `Interval` five times faster, but eight writers are still slower than one, 1.48 million appends per second against 3.03. A leader/follower writer queue is the known answer and it has not been justified: at 100k unpipelined requests per second the lock is not what the server waits on.
+
+**Keys are stored whole in the sorted files.** Prefix compression pays as much as the key distribution allows and nothing here measures that distribution, so it stays a candidate rather than a plan.
+
 ## Benchmarking
 
 Three levels, all committed and rerunnable:
@@ -449,7 +465,9 @@ Three levels, all committed and rerunnable:
 - each stage ships the measurement that shaped its design as an example anyone can rerun, `cargo run --release --example wal_bench` for the log, `--example compaction` for the levels, `--example bloom_fp` for the filters.
 - `redis-benchmark` measures the whole path over TCP with the same tool and flags people point at Redis, so the result can be compared to Redis running on the same machine.
 
-Profiling runs on a release build that keeps its symbols. `./scripts/flamegraph-server.sh` samples the server under a write load with the `sample` tool macOS ships, folds the stacks with inferno and demangles them with rustfilt (`cargo install inferno rustfilt`). No root and no Xcode: cargo-flamegraph would be the usual choice, but its macOS backend now goes through `xctrace`, which needs a full Xcode install rather than the command line tools. A flamegraph that motivated an optimization is committed under `docs/`, next to the numbers it explains.
+Profiling runs on a release build that keeps its symbols. `./scripts/flamegraph-server.sh [output.svg] [seconds] [write|read]` samples the server under either load with the `sample` tool macOS ships, folds the stacks with inferno and demangles them with rustfilt (`cargo install inferno rustfilt`). No root and no Xcode: cargo-flamegraph would be the usual choice, but its macOS backend now goes through `xctrace`, which needs a full Xcode install rather than the command line tools. The read load populates a key space larger than the memtable first, so the lookups it profiles reach the files, and it reports the blocks it read so the artifact says which path it is of.
+
+Both optimizations in this README were found this way, and both were the same shape: an operation that is cheap in itself, made expensive by where it sits. The `write` syscall was 1.5 % of the write profile and the queue behind it was 96.6 %. The CRC-32 table lookup is a few cycles and the 4096-long dependency chain of them was 94 % of a warm read. Neither was found by reading the code.
 
 Measurements are taken on an Apple M4 Pro, 12 cores, 24 GB unified memory.
 
@@ -459,7 +477,7 @@ Measurements are taken on an Apple M4 Pro, 12 cores, 24 GB unified memory.
     crates/lsmkv/src/memtable/  the two in-memory tables behind one trait
     crates/lsmkv/benches/ criterion micro-benchmarks, one file per structure
     crates/lsmkv-server/  RESP2 server on tokio, and the protocol itself
-    docs/                 flamegraphs the README cites
+    docs/                 flamegraphs the README cites, before and after each fix
     scripts/              benchmark and profiling drivers
     Makefile              build, test and lint entry points
 
