@@ -68,11 +68,11 @@ Adding writers does nothing for `Always` (261 against 259 appends/s) because eve
 
 ### Batching the writes
 
-The `writes` column above is the result of the one optimization stage 7 was pointed at, and it is worth showing where the pointer came from. Stage 1 measured `Interval` as *slower* with eight writers than with one, 243k against 565k appends per second: once the device is out of the way, what remains is one `write` syscall per record taken under one append lock. Stage 6 put a second number on the same thing, 192 864 pipelined writes per second over TCP, which is 192 864 syscalls per second.
+The `writes` column above is the result of the one optimization stage 7 was pointed at, and it is worth showing where the pointer came from. Stage 1 measured `Interval` as *slower* with eight writers than with one, and re-measuring it at this cap for the comparison below puts that at 243k against 565k appends per second. Once the device is out of the way, what remains is one `write` syscall per record taken under one append lock. Stage 6 put a second number on the same thing, 192 864 pipelined writes per second over TCP, which is 192 864 syscalls per second.
 
 The profile is where the intuition got corrected. Both profiles below come from the same command, run on either side of the change, since running it today can only show the state today:
 
-    git checkout 3129f4f   # the commit before this one
+    git checkout 3129f4f   # the commit before the batching
     ./scripts/flamegraph-server.sh docs/flamegraph-write-path-before.svg
 
 [The flamegraph before the change](docs/flamegraph-write-path-before.svg), same load, does not say what those two numbers suggest. The `write` syscall itself is 1.5 % of the samples. What holds 96.6 % of them is `__psynch_mutexwait` under `wal::Shared::append`: blocking-pool threads queued on the append lock, waiting for whichever one holds it to come back from its syscall.
@@ -94,7 +94,7 @@ Same machine, same benchmark, same 1M cap, before and after:
 | interval 10ms | 1 | 564658 | 3030703 | 5.4x |
 | interval 10ms | 8 | 242801 | 1481473 | 6.1x |
 
-`Always` and single-writer `Group` are unchanged, which is the check that the change did nothing but remove syscalls: with one record in flight there is no batch to form, and the device flush is 99.99% of the cost anyway. Where a batch does form, one write now carries 460 records.
+`Always` and single-writer `Group` are unchanged, which is the check that the change did nothing but remove syscalls: with one record in flight there is no batch to form, and the device flush is 99 % of the cost anyway. Where a batch does form, one write now carries 460 records.
 
 The eight-writer `Group` gain is a side effect worth naming: appends per flush rose from 4.0 to 4.6 without any commit delay being added. A writer that no longer holds the append lock across a syscall releases it sooner, so more writers reach the queue before the round closes. That is a partial answer to the open question stage 1 left, whether a PostgreSQL-style commit delay is needed to fill the rounds.
 
@@ -152,7 +152,7 @@ Then the measurement the skiplist was written for, an insert while readers hamme
 
 Eight readers multiply a `BTreeMap` insert by 60 and a skiplist insert by 2.8. What the `BTreeMap` suffers is not contention in the usual sense, it is the writer being starved: a reader-preferring `RwLock` lets a steady stream of readers hold the shared lock continuously, and the writer waits for a gap between them that never comes. That is the shape a lock-free structure removes, and it removes it.
 
-The reads going the other way is the cost of the trade. A `BTreeMap` node holds its keys contiguously and a lookup walks a handful of cache lines; a skiplist lookup jumps around an arena of several megabytes. Half of the 139.9 ns is that, the rest is copying the value out.
+The reads going the other way is the cost of the trade. A `BTreeMap` node holds its keys contiguously and a lookup walks a handful of cache lines; a skiplist lookup jumps around an arena of several megabytes. The miss row separates the two costs: 105.8 ns to walk the structure and find nothing, so the remaining 34 ns of a hit is copying the value out. The `BTreeMap` walks the same shape in 71.9 ns.
 
 ### Why the 34x does not reach the server
 
@@ -202,7 +202,7 @@ Blocks are 4 KiB, the default of LevelDB and RocksDB, because this workload is p
 
 The checksum covers a block, which is also the unit of I/O: 4 bytes per 4 KiB, one verification amortized over the tens of records a block holds. Per record it would cost 3.4% of the file and a checksum per record read; per file it could not be verified without reading everything.
 
-Keys are stored whole. Prefix compression pays exactly as much as the key distribution allows and there is no measurement yet, so it is a candidate for the profiling stage, with file size and lookup latency measured before and after rather than assumed.
+Keys are stored whole. Prefix compression pays exactly as much as the key distribution allows and nothing here measures that distribution, so it stays a candidate rather than a plan, and it is listed under [Known limits](#known-limits) with the others.
 
     cargo bench --bench sstable
 
@@ -235,7 +235,7 @@ Naming the function is not the same as naming the cost, since the checksum is in
 
 Everything the design was careful about turned out to be the small part. The positional read that lets concurrent readers share one file handle is 324 ns. The sparse index and the filter that hold a lookup to a single block are 95 ns together. The allocation is 52 ns. What was left was about 7.1 µs, 94 % of a warm lookup, and the profile splits it: 247 samples in `scan_block` against 6554 in the read and its checksum. The checksum was nearly all of it.
 
-Which is not a surprise once stated. The CRC-32 was table driven one byte at a time, and 7.1 µs over 4 KiB is about 7.5 cycles per byte. That is not the table lookup being slow, it is that each step needs the checksum the step before it produced, so the eight-cycle dependency chain runs 4096 times and nothing else can start.
+Which is not a surprise once stated. The CRC-32 was table driven one byte at a time, and 7.1 µs over 4 KiB is about 7.5 cycles per byte. That is not the table lookup being slow, it is that each step needs the checksum the step before it produced, so a dependency chain of roughly eight cycles runs 4096 times and nothing else can start.
 
 ### Breaking the chain
 
@@ -252,10 +252,11 @@ The polynomial does not change, so the bytes on disk do not either: a file writt
 | one 4 KiB positional read | 323.8 ns | 325.9 ns | unchanged |
 | the same, allocating | 375.6 ns | 376.0 ns | unchanged |
 
-The two reads are the control: nothing but the checksum was touched, and they say so. In [the profile afterwards](docs/flamegraph-read-path-after.svg), taken by the same command on this commit, `read_checked` falls from 33.5 % of samples to 3.7 % while `scan_block` holds at 247 samples against 264, which is the same control seen the other way.
+The absent-key row is the one this change does not explain: that path reads no block and verifies no checksum, and it moved anyway. It is reported because it was measured, not because there is an account of it. The two reads are the control: nothing but the checksum was touched, and they say so. In [the profile afterwards](docs/flamegraph-read-path-after.svg), taken by the same command on this commit, `read_checked` falls from 33.5 % of samples to 3.7 % while `scan_block` holds at 247 samples against 264, which is the same control seen the other way.
 
-End to end, on reads that reach the files:
+End to end, on reads that reach the files, the last section of the same script, run on either side of the change as the profiles were:
 
+    git checkout e71555a   # for the before row
     ./scripts/bench-server.sh
 
 | | GET/s | blocks read |
@@ -353,7 +354,7 @@ Two stores, same keys, each key written twice so half the data on disk is obsole
 
 Compaction halves the disk footprint, because the obsolete version of every key is gone, and cuts the block reads an absent key costs by 67 times. The flat store's 11079 is what the theory predicts: 68 overlapping files, 20 000 lookups, 0.82 % false positives each, so 11152 expected. The leveled store consults at most one file per level, so its filters have far less to reject.
 
-The price is 3.61 bytes written per byte ingested, against 1.18. That figure grows with the number of level transitions the data crosses, two here; a store deep enough for four would pay roughly twice as much. This is the write amplification a leveled shape is known for, and the reason the choice was argued from our own profile: writes here are limited by the device flush of the log, at 260 to 1036 per second, not by background bandwidth.
+The price is 3.61 bytes written per byte ingested, against 1.18. That figure grows with the number of level transitions the data crosses, two here; a store deep enough for four would pay roughly twice as much. This is the write amplification a leveled shape is known for, and the reason the choice was argued from our own profile: writes here are limited by the device flush of the log, at 260 to 1179 per second, not by background bandwidth.
 
 Two details worth naming. The 1.18 of the flushes-only store is not 1.00 because every file carries its index, its filter and its framing on top of the entries. And the mean lookup moves far less than the block reads do, because a key that is present is found in one block read either way: what the flat shape wastes is Bloom probes and page cache, not the read that answers.
 
@@ -438,7 +439,7 @@ Each stage lands with its tests before the next one starts.
 7. **Benchmarks and profiling** (built): criterion micro-benchmarks, redis-benchmark end to end, flamegraph of the write path, and the log batching it pointed at.
 8. **Skiplist memtable** (built): hand-written lock-free skiplist measured against the BTreeMap baseline, with the memtable interface extracted from the two rather than from one.
 
-All eight stages are built.
+All eight stages are built. Two optimizations landed after them, both from profiles rather than from the plan: the log batching above and the block checksum below it.
 
 ## Known limits
 
@@ -454,7 +455,7 @@ Each of these is measured rather than suspected, and each is here because the me
 
 ## Benchmarking
 
-Three levels, all committed and rerunnable:
+Four levels, all committed and rerunnable:
 
 - criterion micro-benchmarks isolate one structure at a time: `cargo bench`, reported above.
 - the skiplist carries a loom model of its linking protocol, which runs every interleaving of its writers and every ordering the memory model allows:
