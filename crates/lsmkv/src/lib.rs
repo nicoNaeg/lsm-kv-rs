@@ -9,6 +9,7 @@
 //! The engine is synchronous and owns a single data directory. Network serving
 //! and any async runtime live outside this crate.
 
+pub mod bloom;
 mod checksum;
 mod engine;
 pub mod error;
@@ -19,6 +20,7 @@ pub mod sstable;
 mod testutil;
 pub mod wal;
 
+pub use bloom::Bloom;
 pub use engine::{Config, Engine};
 pub use error::{Error, Result};
 pub use lookup::Lookup;

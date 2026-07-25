@@ -2,15 +2,17 @@
 //! read back through a sparse index.
 //!
 //! ```text
-//! file   := block* index footer
+//! file   := block* filter index footer
 //! block  := record* crc32:u32
 //! record := seq:u64 | kind:u8 = 0 | key_len:u32 | key | value_len:u32 | value
 //!         | seq:u64 | kind:u8 = 1 | key_len:u32 | key
+//! filter := bloom bits | probes:u8 | crc32:u32
 //! index  := min_key_len:u32 | min_key | max_key_len:u32 | max_key
 //!           | entry* | crc32:u32
 //! entry  := key_len:u32 | first key of the block | offset:u64 | len:u32
-//! footer := index_offset:u64 | index_len:u32 | entries:u64 | crc32:u32
-//!           | version:u32 | magic[8]
+//! footer := index_offset:u64 | index_len:u32 | filter_offset:u64
+//!           | filter_len:u32 | entries:u64 | crc32:u32 | version:u32
+//!           | magic[8]
 //! ```
 //!
 //! Records are sorted, and the index holds the first key of each block, so a
@@ -19,12 +21,17 @@
 //!
 //! The checksum unit is the block, which is also the unit of I/O: one read, one
 //! verification, amortized over the tens of records a block holds.
+//!
+//! The index and the Bloom filter are both loaded when the file is opened, so a
+//! lookup for a key the file does not hold usually costs no I/O at all.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::bloom::{self, Bloom};
 use crate::checksum::crc32;
 use crate::error::{Error, Result};
 use crate::lookup::Lookup;
@@ -34,9 +41,12 @@ use crate::lookup::Lookup;
 const BLOCK_SIZE: usize = 4096;
 
 const MAGIC: &[u8] = b"LSMKVSST";
-const FORMAT_VERSION: u32 = 1;
-/// Offset and length of the index, entry count, checksum, version, magic.
-const FOOTER_LEN: usize = 8 + 4 + 8 + 4 + 4 + 8;
+const FORMAT_VERSION: u32 = 2;
+/// Index offset and length, filter offset and length, entry count, checksum,
+/// version, magic.
+const FOOTER_LEN: usize = 8 + 4 + 8 + 4 + 8 + 4 + 4 + 8;
+/// Bytes of the footer the checksum covers.
+const FOOTER_CHECKED: usize = 32;
 const FOOTER_LEN_U64: u64 = FOOTER_LEN as u64;
 /// Length of the checksum that closes a block.
 const CRC_LEN: usize = 4;
@@ -63,6 +73,8 @@ pub struct Writer {
     file: BufWriter<File>,
     block: Vec<u8>,
     blocks: Vec<BlockRef>,
+    /// One hash per entry, kept for the filter built in `finish`.
+    hashes: Vec<u64>,
     first_key: Vec<u8>,
     min_key: Vec<u8>,
     max_key: Vec<u8>,
@@ -90,6 +102,7 @@ impl Writer {
             file: BufWriter::new(file),
             block: Vec::with_capacity(BLOCK_SIZE * 2),
             blocks: Vec::new(),
+            hashes: Vec::new(),
             first_key: Vec::new(),
             min_key: Vec::new(),
             max_key: Vec::new(),
@@ -123,6 +136,7 @@ impl Writer {
         }
         self.max_key.clear();
         self.max_key.extend_from_slice(key);
+        self.hashes.push(bloom::hash(key));
         self.entries += 1;
 
         self.block.extend_from_slice(&seq.to_le_bytes());
@@ -150,6 +164,13 @@ impl Writer {
     pub fn finish(mut self) -> Result<()> {
         self.close_block()?;
 
+        let filter = Bloom::build(&self.hashes, bloom::BITS_PER_KEY);
+        let filter_offset = self.offset;
+        let mut filter_block = filter.as_bytes().to_vec();
+        filter_block.extend_from_slice(&crc32(filter.as_bytes()).to_le_bytes());
+        let filter_len = length_of(&filter_block)?;
+        self.write(&filter_block)?;
+
         let index_offset = self.offset;
         let mut index = Vec::new();
         push_field(&mut index, &self.min_key)?;
@@ -166,6 +187,8 @@ impl Writer {
         let mut footer = Vec::with_capacity(FOOTER_LEN);
         footer.extend_from_slice(&index_offset.to_le_bytes());
         footer.extend_from_slice(&index_len.to_le_bytes());
+        footer.extend_from_slice(&filter_offset.to_le_bytes());
+        footer.extend_from_slice(&filter_len.to_le_bytes());
         footer.extend_from_slice(&self.entries.to_le_bytes());
         footer.extend_from_slice(&crc32(&footer).to_le_bytes());
         footer.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
@@ -220,9 +243,13 @@ pub struct SsTable {
     path: PathBuf,
     file: File,
     blocks: Vec<BlockRef>,
+    filter: Bloom,
     min_key: Vec<u8>,
     max_key: Vec<u8>,
     entries: u64,
+    /// Blocks actually read from the device, which is what the filter is meant
+    /// to keep down.
+    block_reads: AtomicU64,
 }
 
 impl SsTable {
@@ -253,15 +280,20 @@ impl SsTable {
                 format!("format version {version}, expected {FORMAT_VERSION}"),
             ));
         }
-        if crc32(&footer[..20]) != u32_at(&footer, 20) {
+        if crc32(&footer[..FOOTER_CHECKED]) != u32_at(&footer, FOOTER_CHECKED) {
             return Err(Error::corrupt(&path, "footer checksum mismatch"));
         }
 
         let index_offset = u64_at(&footer, 0);
         let index_len = u32_at(&footer, 8);
-        let entries = u64_at(&footer, 12);
-        if index_offset + u64::from(index_len) > file_len - FOOTER_LEN_U64 {
-            return Err(Error::corrupt(&path, "index runs past the footer"));
+        let filter_offset = u64_at(&footer, 12);
+        let filter_len = u32_at(&footer, 20);
+        let entries = u64_at(&footer, 24);
+        let trailer = file_len - FOOTER_LEN_U64;
+        if index_offset + u64::from(index_len) > trailer
+            || filter_offset + u64::from(filter_len) > trailer
+        {
+            return Err(Error::corrupt(&path, "footer points past the file"));
         }
 
         let index = read_checked(&file, &path, index_offset, index_len)?;
@@ -269,13 +301,19 @@ impl SsTable {
         let (min_key, max_key, blocks) = parse_index(&mut cursor)
             .ok_or_else(|| Error::corrupt(&path, "index is not readable"))?;
 
+        let filter = read_checked(&file, &path, filter_offset, filter_len)?;
+        let filter = Bloom::decode(&filter)
+            .ok_or_else(|| Error::corrupt(&path, "filter is not readable"))?;
+
         Ok(Self {
             path,
             file,
             blocks,
+            filter,
             min_key,
             max_key,
             entries,
+            block_reads: AtomicU64::new(0),
         })
     }
 
@@ -289,6 +327,11 @@ impl SsTable {
         if key < self.min_key.as_slice() || key > self.max_key.as_slice() {
             return Ok(Lookup::Missing);
         }
+        // A filter that says no is never wrong, and saying no here is what
+        // saves the block read below.
+        if !self.filter.may_contain(key) {
+            return Ok(Lookup::Missing);
+        }
         // The last block whose first key is not past the one we want is the
         // only block that can hold it.
         let candidate = self
@@ -298,6 +341,7 @@ impl SsTable {
             return Ok(Lookup::Missing);
         };
 
+        self.block_reads.fetch_add(1, Ordering::Relaxed);
         let bytes = read_checked(&self.file, &self.path, block.offset, block.len)?;
         scan_block(&bytes, key).ok_or_else(|| Error::corrupt(&self.path, "block is not readable"))
     }
@@ -320,6 +364,17 @@ impl SsTable {
     /// Blocks the file is cut into, which is also the size of its index.
     pub fn block_count(&self) -> usize {
         self.blocks.len()
+    }
+
+    /// Blocks read from the device since the file was opened. A lookup the
+    /// filter rejects adds nothing here.
+    pub fn block_reads(&self) -> u64 {
+        self.block_reads.load(Ordering::Relaxed)
+    }
+
+    /// Bits the Bloom filter holds.
+    pub fn filter_bits(&self) -> usize {
+        self.filter.bits()
     }
 
     /// Path of the file.
@@ -542,6 +597,47 @@ mod tests {
         let table = SsTable::open(&path).expect("open");
         assert_eq!(table.block_count(), 2);
         assert_eq!(table.get(b"a").expect("get"), Lookup::Found(big));
+    }
+
+    #[test]
+    fn keys_the_file_never_held_cost_no_block_read() {
+        const PROBES: usize = 1000;
+
+        let dir = TempDir::new();
+        let table = write_table(&dir.join("t.sst"), 2000);
+        assert_eq!(table.block_reads(), 0);
+
+        for i in 0..PROBES {
+            // Sorts between two keys the file holds, so the key range cannot
+            // reject it and only the filter can.
+            let key = format!("key:{i:06}x");
+            assert_eq!(table.get(key.as_bytes()).expect("get"), Lookup::Missing);
+        }
+
+        // Ten bits per key puts the theoretical count at eight of a thousand.
+        assert!(
+            table.block_reads() < 30,
+            "{} block reads for {PROBES} absent keys",
+            table.block_reads()
+        );
+    }
+
+    #[test]
+    fn a_key_the_file_holds_still_costs_one_block_read() {
+        let dir = TempDir::new();
+        let table = write_table(&dir.join("t.sst"), 2000);
+
+        table.get(b"key:001000").expect("get");
+
+        assert_eq!(table.block_reads(), 1);
+    }
+
+    #[test]
+    fn the_filter_is_sized_from_the_entry_count() {
+        let dir = TempDir::new();
+        let table = write_table(&dir.join("t.sst"), 1000);
+
+        assert_eq!(table.filter_bits(), 1000 * bloom::BITS_PER_KEY);
     }
 
     #[test]

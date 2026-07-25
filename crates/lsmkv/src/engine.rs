@@ -293,6 +293,26 @@ impl Engine {
         self.shared.state.read().expect(POISONED).tables.len()
     }
 
+    /// Blocks read from files since the store was opened, summed over the files
+    /// it currently holds.
+    ///
+    /// A lookup a Bloom filter or a key range rejects adds nothing here, which
+    /// is what makes the filters measurable.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a previous writer panicked while holding the store.
+    pub fn block_reads(&self) -> u64 {
+        self.shared
+            .state
+            .read()
+            .expect(POISONED)
+            .tables
+            .iter()
+            .map(|table| table.block_reads())
+            .sum()
+    }
+
     /// Directory the store lives in.
     pub fn dir(&self) -> &Path {
         &self.shared.dir

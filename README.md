@@ -92,11 +92,12 @@ A delete writes a tombstone instead of erasing the entry, because the key may st
 A memtable that passes its size limit is frozen and a fresh log is started, then a background thread writes the frozen table out as a sorted file. Writes keep landing in the new table while that happens, which is the point of freezing rather than blocking.
 
 ```text
-file   := block* index footer
+file   := block* filter index footer
 block  := record* crc32
 record := seq | kind | key_len | key | value_len | value
+filter := bloom bits | probes | crc32
 index  := key range | (first key of the block, offset, length)* crc32
-footer := index offset and length | entry count | crc32 | version | magic
+footer := index and filter offsets and lengths | entry count | crc32 | version | magic
 ```
 
 Blocks are 4 KiB, the default of LevelDB and RocksDB, because this workload is point lookups: a GET should read one page to return one value, not a chunk sized for scans. The index holds the first key of every block plus the key range of the file, so a lookup rejects the file outright when the key falls outside that range, binary searches the index in memory otherwise, and reads exactly one block. On entries of about 116 bytes that index is roughly 0.7% of the file, and it is loaded once when the file is opened.
@@ -119,6 +120,35 @@ A lookup walks the active memtable, then the frozen ones, then the files from ne
 
 One limitation worth naming: sequence numbers restart at 1 once every log has been flushed away, because nothing on disk persists the counter. It costs nothing today, since the level a value sits in decides whether it wins rather than the number it carries. The manifest of stage 5 is where that counter gets written down.
 
+## Bloom filters
+
+Every file carries a Bloom filter over its keys, held in memory beside its index. A lookup asks the filter before touching the disk: "no" is certain and skips the file, "maybe" costs one block read. It can never miss a key the file does hold, which is the only property the read path needs of it.
+
+Sizing is 10 bits per key with seven probes, the default of LevelDB. The seven probes come from a single hash per key, split in two halves and combined as `h1 + i * h2` (Kirsch and Mitzenmacher), so a higher probe count costs memory rather than hashing. The hash is FNV-1a finished with the splitmix64 mixer, hand-written like the rest of the LSM path.
+
+    cargo run --release --example bloom_fp
+
+Over 36 000 keys, the number a 4 MiB memtable holds, with 200 000 lookups for keys the filter never saw:
+
+| bits per key | probes | filter | measured | theory |
+|--------------|--------|--------|----------|--------|
+| 8 | 6 | 35 KiB | 2.15 % | 2.16 % |
+| 10 | 7 | 43 KiB | 0.80 % | 0.82 % |
+| 12 | 8 | 52 KiB | 0.33 % | 0.31 % |
+| 16 | 11 | 70 KiB | 0.05 % | 0.05 % |
+
+The measured rates land on the theory within a few hundredths of a point, and that agreement is the interesting result: it says the hand-written hash distributes well enough for the analysis to apply. A weak hash shows up here as a measured rate above the theoretical one. The choice of 10 bits is where the returns start falling off: 8 bits saves 8 KiB per file and costs 2.7 times the wasted reads, 16 bits spends 27 KiB more to remove another 0.75 % of lookups.
+
+The same run then measures the store itself. It writes 6000 keys in a scattered order so the eleven files that come out overlap in key range instead of partitioning it, which is both what a real workload produces and the case where the filters matter, since every file then has to be consulted:
+
+| block reads with filters | without | removed | per lookup |
+|--------------------------|---------|---------|------------|
+| 905 | 110000 | 99.18 % | 1.6 µs |
+
+905 block reads against the 902 the theory predicts (11 files times 10 000 lookups times 0.0082), and against the 110 000 a filterless lookup would cost. That is 99.2 % of the read amplification of an absent key removed for 43 KiB of memory per 4 MiB file.
+
+When keys do arrive in order the files partition the key space, and the key range in the footer already rejects them for free. The filter is what covers the case where they do not.
+
 ## Build order
 
 Each stage lands with its tests before the next one starts.
@@ -126,19 +156,19 @@ Each stage lands with its tests before the next one starts.
 1. **Write-ahead log** (built): append-only records with a per-record checksum, replayed at startup to rebuild the memtable, with the three sync policies measured above.
 2. **Memtable and engine API** (built): sorted in-memory table, `get`, `set` and `delete` with tombstones, backed by the WAL and ordered by its sequence numbers.
 3. **Sorted files** (built): writer and reader, 4 KiB blocks, sparse index and footer, log rotation and background flush of a full memtable.
-4. **Bloom filters**: one per file, so a lookup skips a file it cannot hold the key without touching the disk.
+4. **Bloom filters** (built): one per file, so a lookup skips a file that cannot hold the key without touching the disk.
 5. **Compaction**: background merge, tombstone purge, manifest describing the live set of files.
 6. **Server**: RESP2 subset on tokio, so redis-cli and redis-benchmark drive the engine unchanged.
 7. **Benchmarks and profiling**: criterion micro-benchmarks, redis-benchmark end to end, flamegraph of the hot path.
 8. **Skiplist memtable**: hand-written concurrent skiplist measured against the BTreeMap baseline. The memtable interface is extracted then, from two implementations rather than from one.
 
-Current stage: 4.
+Current stage: 5.
 
 ## Benchmarking
 
 Two levels, both committed and rerunnable:
 
-- criterion micro-benchmarks isolate one structure at a time: memtable insert and lookup under concurrent readers, SSTable block read, Bloom filter false positive rate against its bit budget.
+- criterion micro-benchmarks isolate one structure at a time: memtable insert and lookup under concurrent readers, SSTable block read, Bloom filter probe cost.
 - `redis-benchmark` measures the whole path over TCP with the same tool and flags people point at Redis, so the result can be compared to Redis running on the same machine.
 
 On top of those, each stage ships the measurement that shaped its design as an example anyone can rerun, `cargo run --release --example wal_bench` for the log.
