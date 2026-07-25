@@ -13,8 +13,9 @@
 //! sitting inside its key range: that is what makes the Bloom filter, rather
 //! than the range check, the thing answering a miss.
 
-use std::fs;
+use std::fs::{self, File};
 use std::hint::black_box;
+use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 
 use criterion::{Criterion, criterion_group, criterion_main};
@@ -94,5 +95,39 @@ fn get(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, get);
+/// One 4 KiB positional read and nothing else, so the difference against a
+/// lookup above is what verifying the block and searching it add. Same file,
+/// same page cache, so the syscall is the only thing in common.
+fn block_read(c: &mut Criterion) {
+    let scratch = Scratch::new();
+    let table = build(&scratch);
+    let file = File::open(table.path()).expect("open the file again");
+    let blocks = table.block_count() as u64;
+    let mut block = vec![0u8; 4096];
+
+    c.bench_function("sstable/read one 4 KiB block", |b| {
+        let mut i = 0u64;
+        b.iter(|| {
+            file.read_at(&mut block, (i % blocks) * 4096)
+                .expect("read a block");
+            i += 1;
+            black_box(&block);
+        });
+    });
+
+    // The same read into a buffer allocated per call, which is what the lookup
+    // path does. Against the one above, this is what that allocation costs.
+    c.bench_function("sstable/read one 4 KiB block, allocating", |b| {
+        let mut i = 0u64;
+        b.iter(|| {
+            let mut block = vec![0u8; 4096];
+            file.read_at(&mut block, (i % blocks) * 4096)
+                .expect("read a block");
+            i += 1;
+            black_box(block)
+        });
+    });
+}
+
+criterion_group!(benches, get, block_read);
 criterion_main!(benches);

@@ -212,7 +212,26 @@ A file of 100 000 entries, read back while it is still in the page cache, so thi
 | key present | 7.52 µs |
 | key absent, inside the file's key range | 94.0 ns |
 
-The gap is the Bloom filter: an absent key is answered from memory 80 times cheaper than the block read a present key needs. The 7.52 µs is the number to be curious about, since nothing in it touches the disk. It covers the positional read of one 4 KiB block, the CRC-32 over those 4 KiB and the scan inside the block. Which of the three dominates is not measured yet, and the hand-written table-driven CRC-32 is the obvious suspect: that is the next flamegraph, and the reason `CRC-32C` with the ARM64 hardware instruction is on the list rather than already done.
+The gap is the Bloom filter: an absent key is answered from memory 80 times cheaper than the block read a present key needs. The 7.5 µs is the number to be curious about, since nothing in it touches the disk.
+
+### Where a warm read actually goes
+
+    ./scripts/flamegraph-server.sh docs/flamegraph-read-path.svg 5 read
+
+[The read path profile](docs/flamegraph-read-path.svg) runs `redis-benchmark -t get` against a store whose key space is several times its memtable, so the lookups reach the files rather than the table the keys were written to: 3.5 million blocks were read during the five seconds it samples. `SsTable::get` holds 34.4 % of the samples, and `read_checked`, which reads one block and verifies it, holds 33.5 % of them. Essentially all of a lookup is that one function.
+
+Naming the function is not the same as naming the cost, since the checksum is inlined into it. Taking the lookup apart with benchmarks that each add one step is what does that:
+
+| step | cost | share of a lookup |
+|------|------|-------------------|
+| range check and Bloom probe, no block read | 94.7 ns | 1.3 % |
+| one 4 KiB positional read, buffer reused | 323.8 ns | 4.3 % |
+| the same, allocating the buffer as the lookup does | 375.6 ns | 5.0 % |
+| the whole lookup | 7.54 µs | |
+
+Everything the design was careful about turns out to be the small part. The positional read that lets concurrent readers share one file handle is 324 ns. The sparse index and the filter that hold a lookup to a single block are 95 ns together. The allocation is 52 ns. What is left is about 7.1 µs, 94 % of a warm lookup, and the profile splits it: 247 samples in `scan_block` against 6554 in the read and its checksum. The checksum is nearly all of it.
+
+That is not a surprise once stated. The CRC-32 is hand-written and table driven, one byte at a time, and 7.1 µs over 4 KiB is about 7.5 cycles per byte, which is what that shape costs. `CRC-32C` with the ARM64 `crc32c` instruction consumes 8 bytes per instruction, and slice-by-8 tables get most of the way there with no instruction set dependency. Both change the bytes on disk, so either is an SSTable format version rather than a drop-in, which is why this is written down with its number instead of already done.
 
 ### What a crash during a flush must not cost
 
@@ -426,7 +445,7 @@ Requires a stable Rust toolchain; `rust-toolchain.toml` pins the channel and the
     make lint        rustfmt check, then clippy with warnings denied
     make fmt         format, then apply the clippy fixes
 
-`./scripts/bench-server.sh` compares the server against Redis and needs `redis-benchmark` and `redis-server` on the path (`brew install redis`). `make flamegraph` profiles the server under a write load and needs `cargo install inferno rustfilt`.
+`./scripts/bench-server.sh` compares the server against Redis and needs `redis-benchmark` and `redis-server` on the path (`brew install redis`). `make flamegraph` profiles the server under a write load and needs `cargo install inferno rustfilt`; `./scripts/flamegraph-server.sh docs/out.svg 5 read` profiles the read path instead.
 
 ## License
 
