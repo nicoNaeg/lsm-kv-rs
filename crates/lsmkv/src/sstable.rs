@@ -33,6 +33,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::bloom::{self, Bloom};
 use crate::checksum::crc32;
+use crate::coding::{
+    length_of, push_field, take_field, take_u8, take_u32, take_u64, u32_at, u64_at,
+};
 use crate::error::{Error, Result};
 use crate::lookup::Lookup;
 
@@ -247,6 +250,7 @@ pub struct SsTable {
     min_key: Vec<u8>,
     max_key: Vec<u8>,
     entries: u64,
+    bytes: u64,
     /// Blocks actually read from the device, which is what the filter is meant
     /// to keep down.
     block_reads: AtomicU64,
@@ -313,6 +317,7 @@ impl SsTable {
             min_key,
             max_key,
             entries,
+            bytes: file_len,
             block_reads: AtomicU64::new(0),
         })
     }
@@ -359,6 +364,11 @@ impl SsTable {
     /// Entries the file holds, tombstones included.
     pub fn entries(&self) -> u64 {
         self.entries
+    }
+
+    /// Size of the file on disk.
+    pub fn size_bytes(&self) -> u64 {
+        self.bytes
     }
 
     /// Blocks the file is cut into, which is also the size of its index.
@@ -422,7 +432,7 @@ fn parse_index(cursor: &mut &[u8]) -> Option<(Vec<u8>, Vec<u8>, Vec<BlockRef>)> 
 fn scan_block(mut cursor: &[u8], key: &[u8]) -> Option<Lookup> {
     while !cursor.is_empty() {
         let _seq = take_u64(&mut cursor)?;
-        let kind = take(&mut cursor, 1)?[0];
+        let kind = take_u8(&mut cursor)?;
         let found = take_field(&mut cursor)?;
         let value = match kind {
             KIND_SET => Some(take_field(&mut cursor)?),
@@ -440,47 +450,6 @@ fn scan_block(mut cursor: &[u8], key: &[u8]) -> Option<Lookup> {
         }
     }
     Some(Lookup::Missing)
-}
-
-fn push_field(buf: &mut Vec<u8>, field: &[u8]) -> Result<()> {
-    buf.extend_from_slice(&length_of(field)?.to_le_bytes());
-    buf.extend_from_slice(field);
-    Ok(())
-}
-
-fn length_of(bytes: &[u8]) -> Result<u32> {
-    u32::try_from(bytes.len()).map_err(|_| Error::TooLarge { len: bytes.len() })
-}
-
-fn take<'a>(cursor: &mut &'a [u8], len: usize) -> Option<&'a [u8]> {
-    let (head, rest) = cursor.split_at_checked(len)?;
-    *cursor = rest;
-    Some(head)
-}
-
-fn take_field<'a>(cursor: &mut &'a [u8]) -> Option<&'a [u8]> {
-    let len = usize::try_from(take_u32(cursor)?).ok()?;
-    take(cursor, len)
-}
-
-fn take_u32(cursor: &mut &[u8]) -> Option<u32> {
-    Some(u32::from_le_bytes(take(cursor, 4)?.try_into().ok()?))
-}
-
-fn take_u64(cursor: &mut &[u8]) -> Option<u64> {
-    Some(u64::from_le_bytes(take(cursor, 8)?.try_into().ok()?))
-}
-
-fn u32_at(bytes: &[u8], offset: usize) -> u32 {
-    let mut field = [0u8; 4];
-    field.copy_from_slice(&bytes[offset..offset + 4]);
-    u32::from_le_bytes(field)
-}
-
-fn u64_at(bytes: &[u8], offset: usize) -> u64 {
-    let mut field = [0u8; 8];
-    field.copy_from_slice(&bytes[offset..offset + 8]);
-    u64::from_le_bytes(field)
 }
 
 #[cfg(test)]

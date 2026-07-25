@@ -15,7 +15,8 @@
 //! without the numbering of the ones that remain depending on them.
 
 use crate::checksum::crc32;
-use crate::error::{Error, Result};
+use crate::coding::{length_of, take_field, take_u8, take_u64};
+use crate::error::Result;
 
 /// Bytes preceding the payload: the checksum and the payload length.
 pub(crate) const HEADER_LEN: usize = 8;
@@ -94,36 +95,19 @@ pub(crate) fn encode(buf: &mut Vec<u8>, seq: u64, key: &[u8], value: Option<&[u8
 /// Decodes a payload whose checksum already matched, or `None` if it does not
 /// describe a record this version understands.
 pub(crate) fn decode(payload: &[u8]) -> Option<Record> {
-    let (seq, rest) = payload.split_at_checked(8)?;
-    let seq = u64::from_le_bytes(seq.try_into().ok()?);
-    let (&kind, rest) = rest.split_first()?;
-    let (key, rest) = take_field(rest)?;
+    let mut cursor = payload;
+    let seq = take_u64(&mut cursor)?;
+    let kind = take_u8(&mut cursor)?;
+    let key = take_field(&mut cursor)?.to_vec();
 
     match kind {
         KIND_SET => {
-            let (value, rest) = take_field(rest)?;
-            rest.is_empty().then(|| Record::Set {
-                seq,
-                key: key.to_vec(),
-                value: value.to_vec(),
-            })
+            let value = take_field(&mut cursor)?.to_vec();
+            cursor.is_empty().then_some(Record::Set { seq, key, value })
         }
-        KIND_DELETE => rest.is_empty().then(|| Record::Delete {
-            seq,
-            key: key.to_vec(),
-        }),
+        KIND_DELETE => cursor.is_empty().then_some(Record::Delete { seq, key }),
         _ => None,
     }
-}
-
-fn take_field(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
-    let (len, rest) = bytes.split_at_checked(4)?;
-    let len = usize::try_from(u32::from_le_bytes(len.try_into().ok()?)).ok()?;
-    rest.split_at_checked(len)
-}
-
-fn length_of(bytes: &[u8]) -> Result<u32> {
-    u32::try_from(bytes.len()).map_err(|_| Error::TooLarge { len: bytes.len() })
 }
 
 #[cfg(test)]

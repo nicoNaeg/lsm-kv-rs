@@ -6,6 +6,13 @@
 //! writes the frozen table out as a sorted file and deletes the logs it made
 //! redundant. A read walks the active table, then the frozen ones, then the
 //! files from newest to oldest, and stops at the first level that answers.
+//!
+//! The manifest records which files are live. Writing it is the commit point of
+//! a flush: a table it does not name is an orphan a crash left behind, which
+//! opening the store deletes, and the log that fed it is still there to replay.
+//!
+//! Locks are always taken in this order: the log, the durable state, the flush
+//! queue, then the state in memory.
 
 use std::fs::{self, File};
 use std::ops::ControlFlow;
@@ -17,6 +24,7 @@ use std::time::Duration;
 
 use crate::error::{Error, Result};
 use crate::lookup::Lookup;
+use crate::manifest::{FileMeta, Manifest, Snapshot};
 use crate::memtable::Memtable;
 use crate::sstable::{SsTable, Writer};
 use crate::wal::{Record, SyncPolicy, Wal};
@@ -65,6 +73,10 @@ struct Shared {
     /// The current log. Writers hold it for reading, which is what stops a
     /// rotation from splitting a write between two logs.
     wal: RwLock<Wal>,
+    /// The file set as it is recorded on disk, with the manifest that records
+    /// it. Held while a change is committed, so only one flush or compaction
+    /// changes the file set at a time.
+    durable: Mutex<Durable>,
     /// Signals work to the flush thread, and progress back to whoever waits.
     /// Locked before `state`, never after.
     queue: Mutex<FlushQueue>,
@@ -74,6 +86,12 @@ struct Shared {
     next_number: AtomicU64,
     /// Failure of a background flush, reported to the next caller that can.
     flush_error: Mutex<Option<Error>>,
+}
+
+#[derive(Debug)]
+struct Durable {
+    manifest: Manifest,
+    snapshot: Snapshot,
 }
 
 #[derive(Debug, Default)]
@@ -90,8 +108,9 @@ struct State {
     active_logs: Vec<PathBuf>,
     /// Tables frozen but not yet on disk, newest first.
     frozen: Vec<Frozen>,
-    /// Files on disk, newest first.
-    tables: Vec<Arc<SsTable>>,
+    /// Files by level. Level 0 holds files that may overlap, newest first;
+    /// deeper levels hold files that never overlap, sorted by key.
+    levels: Vec<Vec<Arc<SsTable>>>,
 }
 
 /// A memtable waiting to become a file, and the logs that still hold it.
@@ -112,6 +131,7 @@ impl Engine {
     pub fn open(dir: impl AsRef<Path>, config: Config) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir).map_err(|err| Error::io(&dir, err))?;
+        let manifest = Manifest::new(&dir);
         let listing = Listing::scan(&dir)?;
 
         // A table a crash caught mid-write is unusable, and the logs it was
@@ -120,20 +140,33 @@ impl Engine {
             fs::remove_file(path).map_err(|err| Error::io(path, err))?;
         }
 
-        let mut tables = Vec::with_capacity(listing.tables.len());
-        for number in &listing.tables {
-            tables.push(Arc::new(SsTable::open(
-                dir.join(file_name(*number, TABLE_EXT)),
-            )?));
-        }
-        // Highest number is the most recent write, and a lookup wants that
-        // first.
-        tables.reverse();
+        let snapshot = match manifest.load()? {
+            Some(snapshot) => snapshot,
+            None if listing.tables.is_empty() => Snapshot::default(),
+            None => {
+                return Err(Error::corrupt(
+                    &dir,
+                    "tables are present but the manifest naming them is gone",
+                ));
+            }
+        };
 
+        // A table the manifest does not name belongs to a flush or a compaction
+        // a crash interrupted before it committed. Its data is still in a log.
+        for number in &listing.tables {
+            if !snapshot.files.iter().any(|file| file.number == *number) {
+                let path = dir.join(file_name(*number, TABLE_EXT));
+                fs::remove_file(&path).map_err(|err| Error::io(&path, err))?;
+            }
+        }
+
+        let levels = open_levels(&dir, &snapshot)?;
         let active = Memtable::new();
         let mut active_logs = Vec::new();
-        let mut next_number = listing.next_number;
-        let mut last_seq = 0;
+        let mut next_number = listing.next_number.max(snapshot.next_number);
+        // Numbering picks up where the manifest left it, so it survives a store
+        // whose logs have all been flushed away.
+        let mut last_seq = snapshot.last_seq;
 
         // Every log still present holds records no table carries yet, so they
         // all rebuild the one active table.
@@ -155,7 +188,9 @@ impl Engine {
         } else {
             let path = dir.join(file_name(next_number, LOG_EXT));
             next_number += 1;
-            let wal = Wal::create(&path, config.sync, 0)?;
+            // From what the manifest recorded, not from zero: a store can hold
+            // files without holding a log.
+            let wal = Wal::create(&path, config.sync, last_seq)?;
             active_logs.push(path);
             wal
         };
@@ -166,11 +201,12 @@ impl Engine {
             wal: RwLock::new(wal),
             queue: Mutex::new(FlushQueue::default()),
             progress: Condvar::new(),
+            durable: Mutex::new(Durable { manifest, snapshot }),
             state: RwLock::new(State {
                 active: Arc::new(active),
                 active_logs,
                 frozen: Vec::new(),
-                tables,
+                levels,
             }),
             next_number: AtomicU64::new(next_number),
             flush_error: Mutex::new(None),
@@ -201,9 +237,11 @@ impl Engine {
                 return Ok(answer);
             }
         }
-        for table in &state.tables {
-            if let ControlFlow::Break(answer) = answer(table.get(key)?) {
-                return Ok(answer);
+        for level in &state.levels {
+            for table in level {
+                if let ControlFlow::Break(answer) = answer(table.get(key)?) {
+                    return Ok(answer);
+                }
             }
         }
         Ok(None)
@@ -284,13 +322,45 @@ impl Engine {
         self.shared.wait_for_flush()
     }
 
-    /// Files the store holds.
+    /// Files the store holds, across every level.
     ///
     /// # Panics
     ///
     /// Panics if a previous writer panicked while holding the store.
     pub fn table_count(&self) -> usize {
-        self.shared.state.read().expect(POISONED).tables.len()
+        self.shared
+            .state
+            .read()
+            .expect(POISONED)
+            .levels
+            .iter()
+            .map(Vec::len)
+            .sum()
+    }
+
+    /// Files held at each level, level 0 first.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a previous writer panicked while holding the store.
+    pub fn level_sizes(&self) -> Vec<usize> {
+        self.shared
+            .state
+            .read()
+            .expect(POISONED)
+            .levels
+            .iter()
+            .map(Vec::len)
+            .collect()
+    }
+
+    /// Highest sequence number the store has handed out.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a previous writer panicked while holding the log.
+    pub fn last_sequence(&self) -> u64 {
+        self.shared.wal.read().expect(POISONED).last_sequence()
     }
 
     /// Blocks read from files since the store was opened, summed over the files
@@ -307,8 +377,9 @@ impl Engine {
             .state
             .read()
             .expect(POISONED)
-            .tables
+            .levels
             .iter()
+            .flatten()
             .map(|table| table.block_reads())
             .sum()
     }
@@ -386,7 +457,9 @@ impl Shared {
         };
         state.frozen.insert(0, frozen);
         state.active = Arc::new(Memtable::new());
-        queue.pending += 1;
+        // Always the count of frozen tables rather than a running total, so no
+        // failure path can leave the two disagreeing.
+        queue.pending = state.frozen.len();
 
         drop(state);
         drop(queue);
@@ -443,14 +516,12 @@ impl Shared {
         // device, so a crash mid-write leaves a file recovery can discard
         // rather than one it would have to trust.
         fs::rename(&partial_path, &table_path).map_err(|err| Error::io(&table_path, err))?;
-        // The directory entry has to be durable before the logs are unlinked,
-        // otherwise a crash could leave neither the logs nor the table.
+        // The directory entry has to be durable before the manifest names it.
         sync_dir(&self.dir)?;
         let table = Arc::new(SsTable::open(&table_path)?);
 
-        {
-            let mut queue = self.queue.lock().expect(POISONED);
-            let mut state = self.state.write().expect(POISONED);
+        // Writing the manifest is what makes the table part of the store.
+        self.commit(&[meta_of(number, 0, &table)], &[], |state| {
             debug_assert!(
                 state
                     .frozen
@@ -459,15 +530,51 @@ impl Shared {
                 "the flusher publishes the table it was handed"
             );
             // Newer than every file, older than everything still in memory.
-            state.tables.insert(0, table);
+            state.levels[0].insert(0, table);
             state.frozen.pop();
-            queue.pending -= 1;
-        }
-        self.progress.notify_all();
+        })?;
 
+        // Before reporting progress, so a caller that waited for the flush can
+        // count on the logs it replaced being gone.
         for log in &frozen.logs {
             fs::remove_file(log).map_err(|err| Error::io(log, err))?;
         }
+        self.mark_progress();
+        Ok(())
+    }
+
+    /// Republishes how much work is left, and wakes whoever waits on it.
+    fn mark_progress(&self) {
+        let mut queue = self.queue.lock().expect(POISONED);
+        queue.pending = self.state.read().expect(POISONED).frozen.len();
+        drop(queue);
+        self.progress.notify_all();
+    }
+
+    /// Records a change to the file set, then publishes it in memory.
+    ///
+    /// The manifest write is the commit point, so it happens before anything in
+    /// memory moves, and while holding no lock a reader needs.
+    fn commit(
+        &self,
+        added: &[FileMeta],
+        removed: &[u64],
+        publish: impl FnOnce(&mut State),
+    ) -> Result<()> {
+        let last_seq = self.wal.read().expect(POISONED).last_sequence();
+        let mut durable = self.durable.lock().expect(POISONED);
+
+        let mut snapshot = durable.snapshot.clone();
+        snapshot
+            .files
+            .retain(|file| !removed.contains(&file.number));
+        snapshot.files.extend_from_slice(added);
+        snapshot.last_seq = snapshot.last_seq.max(last_seq);
+        snapshot.next_number = self.next_number.load(Ordering::Relaxed);
+        durable.manifest.store(&snapshot)?;
+        durable.snapshot = snapshot;
+
+        publish(&mut self.state.write().expect(POISONED));
         Ok(())
     }
 
@@ -541,6 +648,38 @@ fn apply(memtable: &Memtable, record: Record) -> u64 {
         Record::Delete { key, .. } => memtable.insert(&key, seq, None),
     };
     seq
+}
+
+/// Opens every file the snapshot names, sorted the way each level wants.
+fn open_levels(dir: &Path, snapshot: &Snapshot) -> Result<Vec<Vec<Arc<SsTable>>>> {
+    let mut levels = vec![Vec::new(); snapshot.deepest_level() + 1];
+    let mut files = snapshot.files.clone();
+    files.sort_unstable_by_key(|file| file.number);
+
+    for file in &files {
+        let table = Arc::new(SsTable::open(dir.join(file_name(file.number, TABLE_EXT)))?);
+        levels[file.level].push(table);
+    }
+
+    // Level 0 files overlap, so a lookup consults them newest first. Deeper
+    // levels do not overlap, and key order is what a search there follows.
+    levels[0].reverse();
+    for level in levels.iter_mut().skip(1) {
+        level.sort_by(|left, right| left.min_key().cmp(right.min_key()));
+    }
+    Ok(levels)
+}
+
+/// What the manifest records about a file just written.
+fn meta_of(number: u64, level: usize, table: &SsTable) -> FileMeta {
+    FileMeta {
+        number,
+        level,
+        min_key: table.min_key().to_vec(),
+        max_key: table.max_key().to_vec(),
+        bytes: table.size_bytes(),
+        entries: table.entries(),
+    }
 }
 
 fn file_name(number: u64, extension: &str) -> String {
@@ -778,6 +917,83 @@ mod tests {
         engine.flush().expect("flush");
 
         assert_eq!(value(&engine, b"key"), Some(b"new".to_vec()));
+    }
+
+    #[test]
+    fn the_manifest_records_what_the_store_holds() {
+        let dir = TempDir::new();
+        let engine = open(&dir, 4096);
+        engine.set(b"alpha", b"1").expect("set");
+        engine.set(b"omega", b"2").expect("set");
+        engine.flush().expect("flush");
+
+        let snapshot = Manifest::new(engine.dir())
+            .load()
+            .expect("load")
+            .expect("a flushed store has a manifest");
+
+        assert_eq!(snapshot.files.len(), 1);
+        let file = &snapshot.files[0];
+        assert_eq!(file.level, 0);
+        assert_eq!(file.min_key, b"alpha");
+        assert_eq!(file.max_key, b"omega");
+        assert_eq!(file.entries, 2);
+        assert_eq!(snapshot.last_seq, 2);
+    }
+
+    #[test]
+    fn a_table_the_manifest_does_not_name_is_deleted_at_open() {
+        let dir = TempDir::new();
+        let engine = open(&dir, 4096);
+        engine.set(b"key", b"value").expect("set");
+        engine.flush().expect("flush");
+
+        // What a crash between writing a table and committing it leaves.
+        let orphan = engine.dir().join(file_name(999, TABLE_EXT));
+        fs::write(&orphan, b"a table nothing points at").expect("write");
+        drop(engine);
+
+        let engine = open(&dir, 4096);
+
+        assert!(!orphan.exists(), "an uncommitted table must not be kept");
+        assert_eq!(engine.table_count(), 1);
+        assert_eq!(value(&engine, b"key"), Some(b"value".to_vec()));
+    }
+
+    #[test]
+    fn tables_without_a_manifest_are_refused() {
+        let dir = TempDir::new();
+        let engine = open(&dir, 4096);
+        engine.set(b"key", b"value").expect("set");
+        engine.flush().expect("flush");
+        let manifest = Manifest::new(engine.dir()).path().to_path_buf();
+        drop(engine);
+
+        fs::remove_file(&manifest).expect("remove the manifest");
+
+        // Opening anyway would have to guess at levels and recency, and guessing
+        // wrong resurrects stale values.
+        let err = Engine::open(dir.join("store"), config(4096)).expect_err("must refuse");
+        assert!(matches!(err, Error::Corrupt { .. }), "{err}");
+    }
+
+    #[test]
+    fn sequence_numbers_survive_a_store_whose_logs_are_all_flushed() {
+        let dir = TempDir::new();
+        let engine = open(&dir, 4096);
+        engine.set(b"a", b"1").expect("set");
+        engine.set(b"b", b"2").expect("set");
+        engine.flush().expect("flush");
+        assert_eq!(engine.last_sequence(), 2);
+        assert_eq!(count_files(&engine, LOG_EXT), 1, "the flushed log is gone");
+        drop(engine);
+
+        // Nothing on disk holds those records any more, so only the manifest can
+        // say where the numbering stood.
+        let engine = open(&dir, 4096);
+        assert_eq!(engine.last_sequence(), 2);
+        engine.set(b"c", b"3").expect("set");
+        assert_eq!(engine.last_sequence(), 3);
     }
 
     #[test]

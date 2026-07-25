@@ -11,9 +11,11 @@
 
 pub mod bloom;
 mod checksum;
+mod coding;
 mod engine;
 pub mod error;
 mod lookup;
+pub mod manifest;
 pub mod memtable;
 pub mod sstable;
 #[cfg(test)]
@@ -24,6 +26,7 @@ pub use bloom::Bloom;
 pub use engine::{Config, Engine};
 pub use error::{Error, Result};
 pub use lookup::Lookup;
+pub use manifest::Manifest;
 pub use memtable::Memtable;
 pub use sstable::SsTable;
 pub use wal::{Record, SyncPolicy, Wal};
