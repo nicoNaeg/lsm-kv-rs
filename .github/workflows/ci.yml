@@ -17,3 +17,15 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-features
+
+  loom:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # A separate cache: this job builds the crate under a different cfg,
+          # against a dependency the job above does not have.
+          key: loom
+      - run: make loom
